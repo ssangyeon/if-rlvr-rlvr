@@ -1,0 +1,8 @@
+# Runtime dependencies for the vendored open-instruct IFEval verifier (ifeval_oi).
+# Must be installed on EVERY ray worker node that runs the reward-loop actors.
+# Also requires the nltk 'punkt' and 'punkt_tab' data:
+#   python -c "import nltk; nltk.download('punkt_tab'); nltk.download('punkt')"
+# (or set NLTK_DATA to a path on shared storage visible to all nodes).
+langdetect
+immutabledict
+nltk
