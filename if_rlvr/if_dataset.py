@@ -44,12 +44,30 @@ DATA_SOURCE = "ifeval"
 _VAL_MARKERS = ("val", "eval", "valid", "test")
 
 
+def _make_constraint_free_messages(example: dict) -> list[dict]:
+    # ##6/3 ppl## Build x for p(y|x): remove the dataset constraint text from the user prompt.
+    constraint = (example.get("constraint") or "").strip()
+    messages = [{"role": m["role"], "content": m["content"]} for m in example["messages"]]
+    if not constraint:
+        return messages
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if constraint in content:
+            message["content"] = content.replace(constraint, "", 1).strip()
+            break
+    return messages
+
+
 def _to_verl_row(example: dict, idx: int) -> dict:
     """Map one HF row to verl's RLVR schema (identical to convert_data.py:to_verl_row)."""
     messages = [{"role": m["role"], "content": m["content"]} for m in example["messages"]]
     return {
         "data_source": DATA_SOURCE,
         "prompt": messages,
+        # ##6/3 ppl## Carried to the agent loop for vLLM scoring of final-answer p(y|x).
+        "ppl_prompt": _make_constraint_free_messages(example),
         "ability": "instruction_following",
         "reward_model": {
             "style": "rule",

@@ -278,6 +278,7 @@ class AgentLoopBase(ABC):
         audios: list[Any] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         remove_system_prompt: bool = False,
+        apply_chat_template_kwargs: Optional[dict[str, Any]] = None,
     ):
         """Apply chat template to messages with optional tools, images, and videos.
 
@@ -287,10 +288,16 @@ class AgentLoopBase(ABC):
             images (list[Image.Image], optional): Input images. Defaults to None.
             videos (list[tuple[torch.Tensor, dict]], optional): Input videos. Defaults to None.
             remove_system_prompt (bool, optional): Whether to remove system prompt. Defaults to False.
+            apply_chat_template_kwargs (dict, optional): ##6/3 ppl## Per-call template overrides.
 
         Returns:
             list[int]: Prompt token ids.
         """
+        # ##6/3 ppl## PPL scoring forces enable_thinking=False without changing rollout templating.
+        template_kwargs = dict(self.apply_chat_template_kwargs or {})
+        if apply_chat_template_kwargs:
+            template_kwargs.update(apply_chat_template_kwargs)
+
         if self.processor is not None:
             raw_prompt = await self.loop.run_in_executor(
                 None,
@@ -300,7 +307,7 @@ class AgentLoopBase(ABC):
                     tools=tools,
                     add_generation_prompt=True,
                     tokenize=False,
-                    **self.apply_chat_template_kwargs,
+                    **template_kwargs,
                 ),
             )
 
@@ -324,7 +331,7 @@ class AgentLoopBase(ABC):
                     tools=tools,
                     add_generation_prompt=True,
                     tokenize=True,
-                    **self.apply_chat_template_kwargs,
+                    **template_kwargs,
                 ),
             )
             prompt_ids = normalize_token_ids(tokenized_prompt)

@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import uuid
 from collections import defaultdict
@@ -131,6 +132,79 @@ def compute_response_mask(data: DataProto):
     response_length = responses.size(1)
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
+
+
+def apply_if_ppl_top4_bonus(batch: DataProto, reward_tensor: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
+    # ##6/3 ppl## Add +1 to old_reward>0 rollouts with lowest p(final_answer|constraint_free_x) PPL per prompt.
+    if "constraint_free_ppl" not in batch.non_tensor_batch or "uid" not in batch.non_tensor_batch:
+        return reward_tensor, {}
+
+    ppls = []
+    for value in batch.non_tensor_batch["constraint_free_ppl"]:
+        try:
+            ppls.append(float(value))
+        except (TypeError, ValueError):
+            ppls.append(float("inf"))
+
+    # ##6/3 ppl## Log corpus PPL as exp(total NLL / total final-answer tokens), not mean(sample PPL).
+    nlls = []
+    for value in batch.non_tensor_batch.get("constraint_free_nll", []):
+        try:
+            nlls.append(float(value))
+        except (TypeError, ValueError):
+            nlls.append(float("inf"))
+    token_counts = []
+    for value in batch.non_tensor_batch.get("constraint_free_token_count", []):
+        try:
+            token_counts.append(int(value))
+        except (TypeError, ValueError):
+            token_counts.append(0)
+
+    base_scores = reward_tensor.sum(dim=-1)
+    finite_ppl_mask = np.isfinite(np.asarray(ppls, dtype=np.float64))
+    corpus_ppl_terms = [
+        (nll, token_count)
+        for nll, token_count, is_finite in zip(nlls, token_counts, finite_ppl_mask, strict=False)
+        if is_finite and np.isfinite(nll) and token_count > 0
+    ]
+    total_nll = sum(nll for nll, _ in corpus_ppl_terms)
+    total_tokens = sum(token_count for _, token_count in corpus_ppl_terms)
+    corpus_ppl = math.exp(total_nll / total_tokens) if total_tokens > 0 else 0.0
+    bonus = torch.zeros_like(base_scores, dtype=reward_tensor.dtype)
+    uids = batch.non_tensor_batch["uid"]
+    top_k = 4
+
+    for uid in np.unique(uids):
+        indices = [
+            idx
+            for idx, row_uid in enumerate(uids)
+            if row_uid == uid and finite_ppl_mask[idx] and float(base_scores[idx].detach().cpu()) > 0.0
+        ]
+        indices.sort(key=lambda idx: ppls[idx])
+        for idx in indices[:top_k]:
+            bonus[idx] = 1.0
+
+    if torch.count_nonzero(bonus).item() == 0:
+        metrics = {
+            "if_ppl/finite_count": float(finite_ppl_mask.sum()),
+            "if_ppl/top4_bonus_count": 0.0,
+            "if_ppl/corpus_ppl": float(corpus_ppl),
+        }
+        return reward_tensor, metrics
+
+    updated_reward = reward_tensor.clone()
+    response_mask = batch.batch["response_mask"]
+    last_response_positions = (response_mask.sum(dim=-1).long() - 1).clamp_min(0)
+    row_indices = torch.arange(updated_reward.size(0), device=updated_reward.device)
+    updated_reward[row_indices, last_response_positions] += bonus.to(updated_reward.device)
+
+    finite_ppls = [ppl for ppl, is_finite in zip(ppls, finite_ppl_mask, strict=True) if is_finite]
+    metrics = {
+        "if_ppl/finite_count": float(len(finite_ppls)),
+        "if_ppl/top4_bonus_count": float(torch.count_nonzero(bonus).item()),
+        "if_ppl/corpus_ppl": float(corpus_ppl),
+    }
+    return updated_reward, metrics
 
 
 def compute_spec_decode_metrics(
@@ -1523,6 +1597,9 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        # ##6/3 ppl## Bonus is applied after old IF reward exists and before advantage computation.
+                        reward_tensor, if_ppl_metrics = apply_if_ppl_top4_bonus(batch, reward_tensor)
+                        metrics.update(if_ppl_metrics)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
