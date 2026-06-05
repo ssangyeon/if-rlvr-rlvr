@@ -134,27 +134,102 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def apply_if_ppl_top4_bonus(batch: DataProto, reward_tensor: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
-    # ##6/3 ppl## Add +1 to old_reward>0 rollouts with lowest p(final_answer|constraint_free_x) PPL per prompt.
-    if "constraint_free_ppl" not in batch.non_tensor_batch or "uid" not in batch.non_tensor_batch:
+# ##6/3 ppl## How to handle rollouts that reach max_response_length: use, zero reward, or drop.
+_CLIPPED_ROLLOUT_MODES = {"use", "zero", "drop"}
+
+
+def normalize_clipped_rollout_mode(mode: Any) -> str:
+    # ##6/3 ppl## Keep a few aliases so shell/env values are forgiving.
+    normalized = str(mode or "use").strip().lower()
+    aliases = {"keep": "use", "original": "use", "reward_zero": "zero", "zero_reward": "zero"}
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in _CLIPPED_ROLLOUT_MODES:
+        raise ValueError(f"clipped_rollout_mode must be one of {_CLIPPED_ROLLOUT_MODES}, got: {mode}")
+    return normalized
+
+
+def get_clipped_rollout_mask(batch: DataProto) -> torch.Tensor:
+    # ##6/3 ppl## metric_utils treats response_length == max_response_length as clipped.
+    response_mask = batch.batch["response_mask"]
+    max_response_length = batch.batch["responses"].shape[-1]
+    response_lengths = response_mask.sum(dim=-1)
+    return torch.eq(response_lengths, max_response_length)
+
+
+def apply_clipped_rollout_batch_mode(batch: DataProto, mode: Any) -> tuple[DataProto, dict[str, float]]:
+    # ##6/3 ppl## Drop clipped rollouts before logprob/ref/actor work when requested.
+    mode = normalize_clipped_rollout_mode(mode)
+    clipped_mask = get_clipped_rollout_mask(batch)
+    clipped_count = int(clipped_mask.sum().detach().cpu().item())
+    original_count = len(batch)
+    metrics = {
+        "clipped_rollout/count": float(clipped_count),
+        "clipped_rollout/ratio": float(clipped_count / max(original_count, 1)),
+        "clipped_rollout/mode_use": float(mode == "use"),
+        "clipped_rollout/mode_zero": float(mode == "zero"),
+        "clipped_rollout/mode_drop": float(mode == "drop"),
+        "clipped_rollout/dropped_count": 0.0,
+        "clipped_rollout/kept_count": float(original_count),
+    }
+    if mode != "drop" or clipped_count == 0:
+        return batch, metrics
+
+    keep_mask = torch.logical_not(clipped_mask).detach().cpu()
+    kept_count = int(keep_mask.sum().item())
+    if kept_count == 0:
+        raise ValueError("clipped_rollout_mode=drop would remove every rollout in the batch")
+    metrics["clipped_rollout/dropped_count"] = float(clipped_count)
+    metrics["clipped_rollout/kept_count"] = float(kept_count)
+    return batch[keep_mask], metrics
+
+
+def apply_clipped_rollout_reward_mode(
+    batch: DataProto, reward_tensor: torch.Tensor, mode: Any
+) -> tuple[torch.Tensor, dict[str, float]]:
+    # ##6/3 ppl## In zero mode, clipped rollouts stay in-batch but receive no constraint/PPL reward.
+    mode = normalize_clipped_rollout_mode(mode)
+    clipped_mask = get_clipped_rollout_mask(batch)
+    zero_count = int(clipped_mask.sum().detach().cpu().item()) if mode == "zero" else 0
+    metrics = {"clipped_rollout/zero_reward_count": float(zero_count)}
+    if mode != "zero" or zero_count == 0:
+        return reward_tensor, metrics
+
+    updated_reward = reward_tensor.clone()
+    updated_reward[clipped_mask.to(updated_reward.device)] = 0.0
+    return updated_reward, metrics
+
+
+def apply_if_ppl_rank_reward(
+    batch: DataProto,
+    reward_tensor: torch.Tensor,
+    ppl_reward_coeff: float = 1.0,
+    rollout_n: int | None = None,
+    metric_prefix: str = "if_p_y_given_x",
+    ppl_key: str = "p_y_given_x_ppl",
+    nll_key: str = "p_y_given_x_nll",
+    token_count_key: str = "p_y_given_x_token_count",
+) -> tuple[torch.Tensor, dict[str, float]]:
+    # ##6/3 ppl## Reward low-PPL and penalize high-PPL samples per prompt.
+    # Only old_reward>0 rows receive the PPL rank reward, preserving the IF gate.
+    if ppl_key not in batch.non_tensor_batch or "uid" not in batch.non_tensor_batch:
         return reward_tensor, {}
 
     ppls = []
-    for value in batch.non_tensor_batch["constraint_free_ppl"]:
+    for value in batch.non_tensor_batch[ppl_key]:
         try:
             ppls.append(float(value))
         except (TypeError, ValueError):
             ppls.append(float("inf"))
 
-    # ##6/3 ppl## Log corpus PPL as exp(total NLL / total final-answer tokens), not mean(sample PPL).
+    # ##6/3 ppl## Log corpus PPL as exp(total NLL / total continuation tokens), not mean(sample PPL).
     nlls = []
-    for value in batch.non_tensor_batch.get("constraint_free_nll", []):
+    for value in batch.non_tensor_batch.get(nll_key, []):
         try:
             nlls.append(float(value))
         except (TypeError, ValueError):
             nlls.append(float("inf"))
     token_counts = []
-    for value in batch.non_tensor_batch.get("constraint_free_token_count", []):
+    for value in batch.non_tensor_batch.get(token_count_key, []):
         try:
             token_counts.append(int(value))
         except (TypeError, ValueError):
@@ -172,23 +247,50 @@ def apply_if_ppl_top4_bonus(batch: DataProto, reward_tensor: torch.Tensor) -> tu
     corpus_ppl = math.exp(total_nll / total_tokens) if total_tokens > 0 else 0.0
     bonus = torch.zeros_like(base_scores, dtype=reward_tensor.dtype)
     uids = batch.non_tensor_batch["uid"]
-    top_k = 4
+    top_k = max(int(rollout_n or 0) // 2, 1)
+    low_ppl_candidate_count = 0
+    high_ppl_candidate_count = 0
 
     for uid in np.unique(uids):
-        indices = [
-            idx
-            for idx, row_uid in enumerate(uids)
-            if row_uid == uid and finite_ppl_mask[idx] and float(base_scores[idx].detach().cpu()) > 0.0
-        ]
+        indices = [idx for idx, row_uid in enumerate(uids) if row_uid == uid and finite_ppl_mask[idx]]
         indices.sort(key=lambda idx: ppls[idx])
-        for idx in indices[:top_k]:
-            bonus[idx] = 1.0
+        low_ppl_indices = indices[:top_k]
+        high_ppl_indices = indices[-top_k:]
+        low_ppl_candidate_count += len(low_ppl_indices)
+        high_ppl_candidate_count += len(high_ppl_indices)
+        for idx in low_ppl_indices:
+            if float(base_scores[idx].detach().cpu()) > 0.0:
+                bonus[idx] += float(ppl_reward_coeff)
+        for idx in high_ppl_indices:
+            if float(base_scores[idx].detach().cpu()) > 0.0:
+                bonus[idx] -= float(ppl_reward_coeff)
+
+    base_reward_scores = base_scores.detach().float()
+    ppl_rank_reward_scores = bonus.detach().float()
+    composed_reward_scores = base_reward_scores + ppl_rank_reward_scores
+    reward_split_metrics = {
+        f"{metric_prefix}/base_reward/mean": float(base_reward_scores.mean().cpu().item()),
+        f"{metric_prefix}/base_reward/max": float(base_reward_scores.max().cpu().item()),
+        f"{metric_prefix}/base_reward/min": float(base_reward_scores.min().cpu().item()),
+        f"{metric_prefix}/reward_coeff": float(ppl_reward_coeff),
+        f"{metric_prefix}/rank_reward/mean": float(ppl_rank_reward_scores.mean().cpu().item()),
+        f"{metric_prefix}/rank_reward/max": float(ppl_rank_reward_scores.max().cpu().item()),
+        f"{metric_prefix}/rank_reward/min": float(ppl_rank_reward_scores.min().cpu().item()),
+        f"{metric_prefix}/composed_reward/mean": float(composed_reward_scores.mean().cpu().item()),
+        f"{metric_prefix}/composed_reward/max": float(composed_reward_scores.max().cpu().item()),
+        f"{metric_prefix}/composed_reward/min": float(composed_reward_scores.min().cpu().item()),
+    }
 
     if torch.count_nonzero(bonus).item() == 0:
         metrics = {
-            "if_ppl/finite_count": float(finite_ppl_mask.sum()),
-            "if_ppl/top4_bonus_count": 0.0,
-            "if_ppl/corpus_ppl": float(corpus_ppl),
+            f"{metric_prefix}/finite_count": float(finite_ppl_mask.sum()),
+            f"{metric_prefix}/rank_k": float(top_k),
+            f"{metric_prefix}/low_ppl_candidate_count": float(low_ppl_candidate_count),
+            f"{metric_prefix}/high_ppl_candidate_count": float(high_ppl_candidate_count),
+            f"{metric_prefix}/positive_bonus_count": 0.0,
+            f"{metric_prefix}/negative_bonus_count": 0.0,
+            f"{metric_prefix}/corpus_ppl": float(corpus_ppl),
+            **reward_split_metrics,
         }
         return reward_tensor, metrics
 
@@ -200,12 +302,16 @@ def apply_if_ppl_top4_bonus(batch: DataProto, reward_tensor: torch.Tensor) -> tu
 
     finite_ppls = [ppl for ppl, is_finite in zip(ppls, finite_ppl_mask, strict=True) if is_finite]
     metrics = {
-        "if_ppl/finite_count": float(len(finite_ppls)),
-        "if_ppl/top4_bonus_count": float(torch.count_nonzero(bonus).item()),
-        "if_ppl/corpus_ppl": float(corpus_ppl),
+        f"{metric_prefix}/finite_count": float(len(finite_ppls)),
+        f"{metric_prefix}/rank_k": float(top_k),
+        f"{metric_prefix}/low_ppl_candidate_count": float(low_ppl_candidate_count),
+        f"{metric_prefix}/high_ppl_candidate_count": float(high_ppl_candidate_count),
+        f"{metric_prefix}/positive_bonus_count": float(torch.count_nonzero(bonus > 0).item()),
+        f"{metric_prefix}/negative_bonus_count": float(torch.count_nonzero(bonus < 0).item()),
+        f"{metric_prefix}/corpus_ppl": float(corpus_ppl),
+        **reward_split_metrics,
     }
     return updated_reward, metrics
-
 
 def compute_spec_decode_metrics(
     spec_drafts,
@@ -1573,6 +1679,10 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    # ##6/3 ppl## Optional handling for max_response_length-clipped rollouts.
+                    clipped_rollout_mode = self.config.get("clipped_rollout_mode", "use")
+                    batch, clipped_rollout_metrics = apply_clipped_rollout_batch_mode(batch, clipped_rollout_mode)
+                    metrics.update(clipped_rollout_metrics)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1597,9 +1707,39 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
-                        # ##6/3 ppl## Bonus is applied after old IF reward exists and before advantage computation.
-                        reward_tensor, if_ppl_metrics = apply_if_ppl_top4_bonus(batch, reward_tensor)
-                        metrics.update(if_ppl_metrics)
+                        # ##6/3 ppl## Optional zero-reward handling for max_response_length-clipped rollouts.
+                        reward_tensor, clipped_reward_metrics = apply_clipped_rollout_reward_mode(
+                            batch, reward_tensor, clipped_rollout_mode
+                        )
+                        metrics.update(clipped_reward_metrics)
+                        # ##6/3 ppl## Rank rewards are applied after old IF reward exists and before advantage computation.
+                        py_given_x_reward_coeff = float(
+                            self.config.get("if_py_given_x_reward_coeff", self.config.get("if_ppl_reward_coeff", 1.0))
+                        )
+                        px_given_y_reward_coeff = float(self.config.get("if_px_given_y_reward_coeff", 0.0))
+                        rollout_n = int(self.config.actor_rollout_ref.rollout.n)
+                        reward_tensor, py_given_x_metrics = apply_if_ppl_rank_reward(
+                            batch,
+                            reward_tensor,
+                            ppl_reward_coeff=py_given_x_reward_coeff,
+                            rollout_n=rollout_n,
+                            metric_prefix="if_p_y_given_x",
+                            ppl_key="p_y_given_x_ppl",
+                            nll_key="p_y_given_x_nll",
+                            token_count_key="p_y_given_x_token_count",
+                        )
+                        metrics.update(py_given_x_metrics)
+                        reward_tensor, px_given_y_metrics = apply_if_ppl_rank_reward(
+                            batch,
+                            reward_tensor,
+                            ppl_reward_coeff=px_given_y_reward_coeff,
+                            rollout_n=rollout_n,
+                            metric_prefix="if_p_x_given_y",
+                            ppl_key="p_x_given_y_ppl",
+                            nll_key="p_x_given_y_nll",
+                            token_count_key="p_x_given_y_token_count",
+                        )
+                        metrics.update(px_given_y_metrics)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)

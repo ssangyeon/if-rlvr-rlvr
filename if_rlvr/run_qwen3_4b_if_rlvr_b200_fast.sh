@@ -22,6 +22,37 @@ export TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/torchinductor"
 export TRITON_CACHE_DIR="$CACHE_ROOT/triton"
 export TMPDIR="$RUN_TMPDIR"
 
+########################### NLTK data ###########################
+NLTK_DATA_DIR=${NLTK_DATA_DIR:-${CACHE_ROOT}/nltk_data}
+mkdir -p "${NLTK_DATA_DIR}"
+export NLTK_DATA="${NLTK_DATA_DIR}"
+
+python3 - <<'PY'
+import os
+import nltk
+
+data_dir = os.environ["NLTK_DATA"]
+os.makedirs(data_dir, exist_ok=True)
+
+if data_dir not in nltk.data.path:
+    nltk.data.path.insert(0, data_dir)
+
+required = {
+    "punkt_tab": "tokenizers/punkt_tab/english/",
+    "punkt": "tokenizers/punkt/english.pickle",
+}
+
+for pkg, resource in required.items():
+    try:
+        nltk.data.find(resource)
+        print(f"[NLTK] found {resource}")
+    except LookupError:
+        print(f"[NLTK] downloading {pkg} to {data_dir}")
+        nltk.download(pkg, download_dir=data_dir, quiet=False, raise_on_error=True)
+        nltk.data.find(resource)
+PY
+########################### end NLTK data ###########################
+
 ########################### runtime selection (non-invasive) ###########################
 VERL_DIR=${VERL_DIR:-/NHNHOME/WORKSPACE/26msit001_T_A/IFIF/if-rlvr}
 export PYTHONPATH="${VERL_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -48,14 +79,17 @@ NPUS_PER_NODE=${NPUS_PER_NODE:-}
 # original: train_batch_size=256, ppo_mini_batch_size=256, token cap=65536.
 train_batch_size=${TRAIN_BATCH_SIZE:-512}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-${train_batch_size}}
-max_prompt_length=${MAX_PROMPT_LENGTH:-512}
+max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
 max_response_length=${MAX_RESPONSE_LENGTH:-2048}
 ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-98304}
 log_prob_max_token_len_per_gpu=${LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-${ppo_max_token_len_per_gpu}}
 
-actor_lr=${ACTOR_LR:-1e-6}
+actor_lr=${ACTOR_LR:-5e-7}
 kl_loss_coef=${KL_LOSS_COEF:-0.001}
 entropy_coeff=${ENTROPY_COEFF:-0}
+py_given_x_reward_coeff=${PY_GIVEN_X_REWARD_COEFF:-${PPL_REWARD_COEFF:-0.0}}  # ##6/3 ppl## p(y|x)
+px_given_y_reward_coeff=${PX_GIVEN_Y_REWARD_COEFF:-0.0}  # ##6/3 ppl## p(x|y)
+clipped_rollout_mode=${CLIPPED_ROLLOUT_MODE:-zero}  # ##6/3 ppl## use|zero|drop
 
 rollout_tp=${ROLLOUT_TP:-1}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.85}
@@ -63,11 +97,11 @@ rollout_n=${ROLLOUT_N:-8}
 sp_size=${SP_SIZE:-1}
 
 total_epochs=${TOTAL_EPOCHS:-3}
-save_freq=${SAVE_FREQ:-25}
+save_freq=${SAVE_FREQ:-50}
 test_freq=${TEST_FREQ:-1000}
 
 PROJECT_NAME=${PROJECT_NAME:-verl_if_rlvr}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_if_grpo_${INFER_BACKEND}_fsdp_think_${ENABLE_THINKING}}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_if_grpo_${INFER_BACKEND}_fsdp_think_${ENABLE_THINKING}_pyx_${py_given_x_reward_coeff}_pxy_${px_given_y_reward_coeff}_clip_${clipped_rollout_mode}}
 WANDB_ENTITY=${WANDB_ENTITY:-ifif}
 export WANDB_ENTITY
 ########################### end user-adjustable ###########################
@@ -192,6 +226,9 @@ REF=(
 REWARD=(
     custom_reward_function.path="${REWARD_FN_PATH}"
     custom_reward_function.name=compute_score
+    "+if_py_given_x_reward_coeff=${py_given_x_reward_coeff}"  # ##6/3 ppl## p(y|x)
+    "+if_px_given_y_reward_coeff=${px_given_y_reward_coeff}"  # ##6/3 ppl## p(x|y)
+    "+clipped_rollout_mode=${clipped_rollout_mode}"  # ##6/3 ppl##
 )
 
 TRAINER=(

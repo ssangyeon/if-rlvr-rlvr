@@ -58,58 +58,93 @@ class SingleTurnAgentLoop(AgentLoopBase):
             return response_ids, len(response_ids) > 0
         return [], False
 
-    async def _compute_constraint_free_ppl(
+    @staticmethod
+    def _empty_ppl_fields(prefix: str) -> dict[str, Any]:
+        return {
+            f"{prefix}_ppl": float("inf"),
+            f"{prefix}_mean_logprob": None,
+            f"{prefix}_nll": None,
+            f"{prefix}_token_count": 0,
+            f"{prefix}_eligible": False,
+        }
+
+    @staticmethod
+    def _constraint_free_prompt_text(ppl_prompt) -> str:
+        if not ppl_prompt:
+            return ""
+        user_parts = [str(message.get("content", "")) for message in ppl_prompt if message.get("role") == "user"]
+        if user_parts:
+            return "\n".join(part for part in user_parts if part).strip()
+        return "\n".join(str(message.get("content", "")) for message in ppl_prompt).strip()
+
+    async def _score_continuation_ppl(
+        self, prefix_ids: list[int], continuation_ids: list[int], metric_prefix: str
+    ) -> dict[str, Any]:
+        if not prefix_ids or not continuation_ids:
+            return self._empty_ppl_fields(metric_prefix)
+
+        sequence_ids = prefix_ids + continuation_ids
+        score_output: TokenOutput = await self.server_manager.generate(
+            request_id=uuid4().hex,
+            prompt_ids=sequence_ids,
+            sampling_params={"max_tokens": 1, "temperature": 1.0, "prompt_logprobs": 0},
+        )
+        prompt_logprobs = score_output.extra_fields.get("prompt_logprobs") or []
+        start = max(len(prefix_ids) - 1, 0)
+        rows = prompt_logprobs[start : start + len(continuation_ids)]
+        token_logprobs = [float(row[0]) for row in rows if row and row[0] is not None]
+        if len(token_logprobs) != len(continuation_ids):
+            raise ValueError(
+                f"{metric_prefix} PPL logprob length mismatch: "
+                f"got {len(token_logprobs)}, expected {len(continuation_ids)}"
+            )
+        mean_logprob = sum(token_logprobs) / max(len(token_logprobs), 1)
+        nll = -sum(token_logprobs)
+        return {
+            f"{metric_prefix}_ppl": float(math.exp(-mean_logprob)),
+            f"{metric_prefix}_mean_logprob": float(mean_logprob),
+            f"{metric_prefix}_nll": float(nll),
+            f"{metric_prefix}_token_count": len(token_logprobs),
+            f"{metric_prefix}_eligible": True,
+        }
+
+    async def _compute_bidirectional_ppl(
         self, ppl_prompt, response_ids: list[int], prompt_ids: list[int]
     ) -> dict[str, Any]:
-        # ##6/3 ppl## Score p(final_answer_y | constraint_free_x) with the live rollout vLLM.
+        # ##6/3 ppl## Score p(y|x) and p(x|y), where y is the final answer and x is the constraint-free prompt.
         final_answer_ids, eligible = self._extract_final_answer_ids(response_ids, prompt_ids)
+        defaults = {
+            **self._empty_ppl_fields("p_y_given_x"),
+            **self._empty_ppl_fields("p_x_given_y"),
+        }
         if not eligible or not ppl_prompt:
-            return {
-                "constraint_free_ppl": float("inf"),
-                "constraint_free_mean_logprob": None,
-                "constraint_free_nll": None,  # ##6/3 ppl##
-                "constraint_free_token_count": 0,  # ##6/3 ppl##
-                "constraint_free_ppl_eligible": False,
-            }
+            return defaults
 
+        extra_fields = dict(defaults)
         try:
-            ppl_prompt_ids = await self.apply_chat_template(
+            x_prompt_ids = await self.apply_chat_template(
                 list(ppl_prompt),
                 apply_chat_template_kwargs={"enable_thinking": False},
             )
-            sequence_ids = ppl_prompt_ids + final_answer_ids
-            score_output: TokenOutput = await self.server_manager.generate(
-                request_id=uuid4().hex,
-                prompt_ids=sequence_ids,
-                sampling_params={"max_tokens": 1, "temperature": 1.0, "prompt_logprobs": 0},
-            )
-            prompt_logprobs = score_output.extra_fields.get("prompt_logprobs") or []
-            start = max(len(ppl_prompt_ids) - 1, 0)
-            rows = prompt_logprobs[start : start + len(final_answer_ids)]
-            token_logprobs = [float(row[0]) for row in rows if row and row[0] is not None]
-            if len(token_logprobs) != len(final_answer_ids):
-                raise ValueError(
-                    f"PPL logprob length mismatch: got {len(token_logprobs)}, expected {len(final_answer_ids)}"
-                )
-            mean_logprob = sum(token_logprobs) / max(len(token_logprobs), 1)
-            # ##6/3 ppl## Corpus PPL is exp(sum NLL / sum y tokens), so pass both aggregates downstream.
-            nll = -sum(token_logprobs)
-            return {
-                "constraint_free_ppl": float(math.exp(-mean_logprob)),
-                "constraint_free_mean_logprob": float(mean_logprob),
-                "constraint_free_nll": float(nll),
-                "constraint_free_token_count": len(token_logprobs),
-                "constraint_free_ppl_eligible": True,
-            }
+            extra_fields.update(await self._score_continuation_ppl(x_prompt_ids, final_answer_ids, "p_y_given_x"))
         except Exception as exc:  # noqa: BLE001
-            logger.warning("##6/3 ppl## constraint-free PPL scoring failed: %s", exc)
-            return {
-                "constraint_free_ppl": float("inf"),
-                "constraint_free_mean_logprob": None,
-                "constraint_free_nll": None,  # ##6/3 ppl##
-                "constraint_free_token_count": 0,  # ##6/3 ppl##
-                "constraint_free_ppl_eligible": False,
-            }
+            logger.warning("##6/3 ppl## p(y|x) PPL scoring failed: %s", exc)
+
+        try:
+            final_answer_text = self.tokenizer.decode(final_answer_ids, skip_special_tokens=True).strip()
+            x_text = self._constraint_free_prompt_text(ppl_prompt)
+            if not final_answer_text or not x_text:
+                return extra_fields
+            y_prompt_ids = await self.apply_chat_template(
+                [{"role": "user", "content": final_answer_text}],
+                apply_chat_template_kwargs={"enable_thinking": False},
+            )
+            x_response_ids = self.tokenizer.encode(x_text, add_special_tokens=False)
+            extra_fields.update(await self._score_continuation_ppl(y_prompt_ids, x_response_ids, "p_x_given_y"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("##6/3 ppl## p(x|y) PPL scoring failed: %s", exc)
+
+        return extra_fields
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -149,7 +184,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         response_mask = [1] * len(response_ids)
 
         # ##6/3 ppl## Score all rollouts while vLLM is still awake; trainer later gates by old reward.
-        ppl_extra_fields = await self._compute_constraint_free_ppl(kwargs.get("ppl_prompt"), response_ids, prompt_ids)
+        ppl_extra_fields = await self._compute_bidirectional_ppl(kwargs.get("ppl_prompt"), response_ids, prompt_ids)
         extra_fields = dict(token_output.extra_fields)
         extra_fields.update(ppl_extra_fields)
 
