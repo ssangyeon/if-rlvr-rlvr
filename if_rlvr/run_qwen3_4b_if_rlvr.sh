@@ -36,8 +36,17 @@
 
 set -xeuo pipefail
 
+CACHE_ROOT=/NHNHOME/WORKSPACE/26msit001_T_A/IFIF/if-rlvr/.cache
+RUN_TMPDIR=${RUN_TMPDIR:-/var/tmp}
+mkdir -p "$CACHE_ROOT"/{torchinductor,triton} "$RUN_TMPDIR"
+
+export TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/torchinductor"
+export TRITON_CACHE_DIR="$CACHE_ROOT/triton"
+export TMPDIR="$RUN_TMPDIR"
+
 ########################### runtime selection (non-invasive) ###########################
-VERL_DIR=${VERL_DIR:-/lustre/justinseo/if-verl/verl}
+# VERL_DIR=${VERL_DIR:-/lustre/justinseo/if-verl/verl}
+VERL_DIR=${VERL_DIR:-/NHNHOME/WORKSPACE/26msit001_T_A/IFIF/if-rlvr}
 export PYTHONPATH="${VERL_DIR}${PYTHONPATH:+:${PYTHONPATH}}"     # use the if-verl/verl checkout
 IF_RLVR_DIR=${IF_RLVR_DIR:-${VERL_DIR}/if_rlvr}          # self-contained; can live anywhere
 REWARD_FN_PATH="${IF_RLVR_DIR}/if_reward_fn.py"
@@ -48,36 +57,39 @@ DEVICE=${DEVICE:-$(python3 -c 'import torch_npu' 2>/dev/null && echo npu || echo
 INFER_BACKEND=${INFER_BACKEND:-vllm}
 MACHINE=${MACHINE:-}
 
-ENABLE_THINKING=${ENABLE_THINKING:-true}                        # IF: Qwen3 thinking mode true|false
+ENABLE_THINKING=${ENABLE_THINKING:-false}                        # IF: Qwen3 thinking mode true|false
 IF_VAL_SIZE=${IF_VAL_SIZE:-512}                                 # held-out eval examples (open-instruct sampled 16)
 IF_DATA_SEED=${IF_DATA_SEED:-1}                                 # HF split shuffle seed (open-instruct used --seed 1)
+DATA_PROCESSOR_CPU_COUNT=${DATA_PROCESSOR_CPU_COUNT:-64}        # multiprocessing workers for overlong-prompt filtering
 
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B}
 NNODES=${NNODES:-1}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
 NPUS_PER_NODE=${NPUS_PER_NODE:-}
 
-train_batch_size=${TRAIN_BATCH_SIZE:-1024}
-ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-256}
+train_batch_size=${TRAIN_BATCH_SIZE:-512}
+ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-${train_batch_size}}
 max_prompt_length=${MAX_PROMPT_LENGTH:-2048}                    # base value; ~98% of IF prompts fit (set 2048 to keep ~99%)
-max_response_length=${MAX_RESPONSE_LENGTH:-16384}
-ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
+max_response_length=${MAX_RESPONSE_LENGTH:-2048}
+ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-65536}
 
-actor_lr=${ACTOR_LR:-1e-6}
+actor_lr=${ACTOR_LR:-5e-7}
 kl_loss_coef=${KL_LOSS_COEF:-0.001}
 entropy_coeff=${ENTROPY_COEFF:-0}
 
-rollout_tp=${ROLLOUT_TP:-}
-rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-}
+rollout_tp=${ROLLOUT_TP:-1}
+rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.9}
 rollout_n=${ROLLOUT_N:-8}
 sp_size=${SP_SIZE:-1}
 
-total_epochs=${TOTAL_EPOCHS:-15}
-save_freq=${SAVE_FREQ:-20}
-test_freq=${TEST_FREQ:-5}
+total_epochs=${TOTAL_EPOCHS:-3}
+save_freq=${SAVE_FREQ:-25}
+test_freq=${TEST_FREQ:-1000}
 
 PROJECT_NAME=${PROJECT_NAME:-verl_if_rlvr}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_if_grpo_${INFER_BACKEND}_fsdp_think_${ENABLE_THINKING}}
+WANDB_ENTITY=${WANDB_ENTITY:-ifif}
+export WANDB_ENTITY
 ########################### end user-adjustable ###########################
 
 ########################### derived defaults ###########################
@@ -109,7 +121,7 @@ case "${DEVICE}" in
                     EXTRA+=(+actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=flashinfer)
                 fi
                 ;;
-            *) NGPUS_PER_NODE=${NGPUS_PER_NODE:-8} ;;
+            *) NGPUS_PER_NODE=${NGPUS_PER_NODE:-4} ;;
         esac
         n_trainer_devices=${NGPUS_PER_NODE}
         ;;
@@ -118,7 +130,7 @@ case "${DEVICE}" in
         export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
         export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
         export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
-        NPUS_PER_NODE=8
+        NPUS_PER_NODE=4
         n_trainer_devices=${NPUS_PER_NODE}
         actor_param_offload=True
         actor_optimizer_offload=True
@@ -160,6 +172,7 @@ DATA=(
     data.max_prompt_length=${max_prompt_length}
     data.max_response_length=${max_response_length}
     data.filter_overlong_prompts=True
+    data.filter_overlong_prompts_workers=${DATA_PROCESSOR_CPU_COUNT}
     data.truncation='error'
     data.prompt_key=prompt
     data.reward_fn_key=data_source
