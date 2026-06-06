@@ -208,9 +208,12 @@ def apply_if_ppl_rank_reward(
     ppl_key: str = "p_y_given_x_ppl",
     nll_key: str = "p_y_given_x_nll",
     token_count_key: str = "p_y_given_x_token_count",
+    gate_scores: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     # ##6/3 ppl## Reward low-PPL and penalize high-PPL samples per prompt.
-    # Only old_reward>0 rows receive the PPL rank reward, preserving the IF gate.
+    # Only constraint-reward>0 rows receive the PPL rank reward, preserving the IF gate.
+    # ``gate_scores`` is the original constraint reward snapshot (taken before any PPL shaping); when
+    # bidirectional rewards are chained it keeps each direction from gating on the other's bonus.
     if ppl_key not in batch.non_tensor_batch or "uid" not in batch.non_tensor_batch:
         return reward_tensor, {}
 
@@ -236,6 +239,11 @@ def apply_if_ppl_rank_reward(
             token_counts.append(0)
 
     base_scores = reward_tensor.sum(dim=-1)
+    # ##6/3 ppl## Gate on the original constraint reward (snapshot) so chained directions don't see
+    # each other's bonus. Falls back to the running reward when no snapshot is given (single-direction
+    # use is unaffected). Materialized to a CPU float list once to avoid per-row device syncs.
+    gate_source = base_scores if gate_scores is None else gate_scores
+    gate_values = gate_source.detach().to(device="cpu", dtype=torch.float64).tolist()
     finite_ppl_mask = np.isfinite(np.asarray(ppls, dtype=np.float64))
     corpus_ppl_terms = [
         (nll, token_count)
@@ -259,10 +267,10 @@ def apply_if_ppl_rank_reward(
         low_ppl_candidate_count += len(low_ppl_indices)
         high_ppl_candidate_count += len(high_ppl_indices)
         for idx in low_ppl_indices:
-            if float(base_scores[idx].detach().cpu()) > 0.0:
+            if gate_values[idx] > 0.0:
                 bonus[idx] += float(ppl_reward_coeff)
         for idx in high_ppl_indices:
-            if float(base_scores[idx].detach().cpu()) > 0.0:
+            if gate_values[idx] > 0.0:
                 bonus[idx] -= float(ppl_reward_coeff)
 
     base_reward_scores = base_scores.detach().float()
@@ -1712,6 +1720,9 @@ class RayPPOTrainer:
                             batch, reward_tensor, clipped_rollout_mode
                         )
                         metrics.update(clipped_reward_metrics)
+                        # ##6/3 ppl## Snapshot the constraint-only reward BEFORE any PPL shaping so both
+                        # directions gate on the original IF reward, not a PPL-polluted running total.
+                        constraint_reward_scores = reward_tensor.sum(dim=-1).detach().clone()
                         # ##6/3 ppl## Rank rewards are applied after old IF reward exists and before advantage computation.
                         py_given_x_reward_coeff = float(
                             self.config.get("if_py_given_x_reward_coeff", self.config.get("if_ppl_reward_coeff", 1.0))
@@ -1727,6 +1738,7 @@ class RayPPOTrainer:
                             ppl_key="p_y_given_x_ppl",
                             nll_key="p_y_given_x_nll",
                             token_count_key="p_y_given_x_token_count",
+                            gate_scores=constraint_reward_scores,
                         )
                         metrics.update(py_given_x_metrics)
                         reward_tensor, px_given_y_metrics = apply_if_ppl_rank_reward(
@@ -1738,6 +1750,7 @@ class RayPPOTrainer:
                             ppl_key="p_x_given_y_ppl",
                             nll_key="p_x_given_y_nll",
                             token_count_key="p_x_given_y_token_count",
+                            gate_scores=constraint_reward_scores,
                         )
                         metrics.update(px_given_y_metrics)
 

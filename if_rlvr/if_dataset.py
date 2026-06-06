@@ -34,6 +34,8 @@ It is still additive: it modifies no existing verl file.
 
 from __future__ import annotations
 
+import re
+
 import datasets
 import numpy as np
 
@@ -44,19 +46,49 @@ DATA_SOURCE = "ifeval"
 _VAL_MARKERS = ("val", "eval", "valid", "test")
 
 
+def _split_constraints(raw) -> list[str]:
+    # ##6/3 ppl## The HF ``constraint`` field joins multiple constraints with a TAB, but the prompt
+    # joins them with spaces -- so the old whole-string ``constraint in content`` test missed every
+    # multi-constraint row (~75% of the data) and left c inside x. Split on TAB and match each
+    # constraint span individually.
+    return [part.strip() for part in (raw or "").split("\t") if part.strip()]
+
+
+def _strip_constraints_from_text(content: str, parts: list[str]) -> str | None:
+    # ##6/3 ppl## Remove the constraint text c from a user turn, leaving only the base instruction x.
+    #
+    # Constraints are appended as a contiguous, order-preserved suffix (verified on
+    # allenai/IF_multi_constraints_upto5: 100% suffix-contiguous, 0 leaks over 12k rows). The primary
+    # path therefore truncates at the earliest constraint span, which preserves x byte-for-byte
+    # (no whitespace/markup mangling of the instruction). Returns None when this turn holds no
+    # constraint (leave it untouched); never returns text that still contains a constraint span.
+    starts = [content.find(part) for part in parts]
+    found = [pos for pos in starts if pos >= 0]
+    if not found:
+        return None
+    base = content[: min(found)].strip()
+    if base and not any(part in base for part in parts):
+        return base
+    # Fallback (constraints not a clean suffix here, e.g. base is empty or a span repeats): remove
+    # every constraint occurrence in place, longest first so nested spans can't partially match.
+    base = content
+    for part in sorted(parts, key=len, reverse=True):
+        base = base.replace(part, " ")
+    return re.sub(r"[ \t]{2,}", " ", base).strip()
+
+
 def _make_constraint_free_messages(example: dict) -> list[dict]:
-    # ##6/3 ppl## Build x for p(y|x): remove the dataset constraint text from the user prompt.
-    constraint = (example.get("constraint") or "").strip()
+    # ##6/3 ppl## Build x for p(y|x) and p(x|y): drop the constraint text c from the user prompt.
+    parts = _split_constraints(example.get("constraint"))
     messages = [{"role": m["role"], "content": m["content"]} for m in example["messages"]]
-    if not constraint:
+    if not parts:
         return messages
     for message in messages:
         if message.get("role") != "user":
             continue
-        content = message.get("content", "")
-        if constraint in content:
-            message["content"] = content.replace(constraint, "", 1).strip()
-            break
+        stripped = _strip_constraints_from_text(message.get("content", ""), parts)
+        if stripped is not None:
+            message["content"] = stripped
     return messages
 
 
