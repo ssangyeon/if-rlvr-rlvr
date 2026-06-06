@@ -636,6 +636,9 @@ class RayWorkerGroup(WorkerGroup):
             "MASTER_ADDR": self._master_addr,
             "MASTER_PORT": self._master_port,
         }
+        dist_init_method = os.environ.get("DIST_INIT_METHOD")
+        if dist_init_method:
+            env_vars["DIST_INIT_METHOD"] = dist_init_method
         if worker_env is not None:
             logging.debug(f"Appending ray class env, origin: {env_vars}, customized env: {worker_env}")
             conflict_env_vars = set(env_vars.keys()) & set(worker_env.keys())

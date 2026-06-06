@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import os
+import socket
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -155,20 +156,101 @@ class vLLMHttpServer:
         self.profiler_controller = DistProfiler(self.replica_rank, config=profiler_config, tool_config=tool_config)
 
         # used for data parallel: --data-parallel-address, --data-parallel-rpc-port
+        self._master_sock = None
+        self._dp_rpc_sock = None
+        self._dp_master_sock = None
+        self._dp_init_ports = []
+        self._dp_init_socks = []
         if self.node_rank == 0:
             self._master_address = self._server_address
-            # used for torch.distributed.init_process_group
-            self._master_port, self._master_sock = get_free_port(self._server_address, with_alive_sock=True)
-            # used for data parallel: --data-parallel-address, --data-parallel-rpc-port
-            self._dp_rpc_port, self._dp_rpc_sock = get_free_port(self._server_address, with_alive_sock=True)
-            self._dp_master_port, self._dp_master_sock = get_free_port(self._server_address, with_alive_sock=True)
+            vllm_port_base = os.getenv("VLLM_MASTER_PORT_BASE")
+            if vllm_port_base:
+                port_stride = max(int(os.getenv("VLLM_PORT_STRIDE", "100")), 100)
+                replica_base_port = int(vllm_port_base) + self.replica_rank * port_stride
+                (
+                    self._master_port,
+                    self._master_sock,
+                    self._dp_rpc_port,
+                    self._dp_rpc_sock,
+                    self._dp_master_port,
+                    self._dp_master_sock,
+                    self._dp_init_ports,
+                    self._dp_init_socks,
+                ) = self._reserve_port_block(self._server_address, replica_base_port, port_stride)
+            else:
+                # used for torch.distributed.init_process_group
+                self._master_port, self._master_sock = get_free_port(self._server_address, with_alive_sock=True)
+                # used for data parallel: --data-parallel-address, --data-parallel-rpc-port
+                self._dp_rpc_port, self._dp_rpc_sock = get_free_port(self._server_address, with_alive_sock=True)
+                self._dp_master_port, self._dp_master_sock = get_free_port(self._server_address, with_alive_sock=True)
+                self._dp_init_ports = [self._dp_master_port]
+                self._dp_init_socks = [self._dp_master_sock]
         else:
             self._master_address = None
             self._master_port = None
             self._dp_rpc_port = None
             self._dp_master_port = None
+            self._dp_init_ports = []
+            self._dp_init_socks = []
 
         self._post_init(cuda_visible_devices)
+
+    @staticmethod
+    def _reserve_port(address: str, port: int) -> socket.socket:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((address, port))
+            sock.listen(1)
+        except OSError:
+            sock.close()
+            raise
+        return sock
+
+    def _reserve_port_block(self, address: str, base_port: int, stride: int):
+        # vLLM 0.12 may initialize several DP process groups inside spawned
+        # EngineCore processes. Reserve a wider contiguous slot and feed those
+        # exact ports back through _data_parallel_master_port_list so vLLM does
+        # not call get_open_ports_list() and collide with busy 45xxx ports.
+        port_count = int(os.getenv("VLLM_RESERVED_PORT_COUNT", "7"))
+        if port_count < 4:
+            raise ValueError(f"VLLM_RESERVED_PORT_COUNT must be at least 4, got {port_count}")
+        if stride < port_count:
+            raise ValueError(f"VLLM_PORT_STRIDE must be at least {port_count}, got {stride}")
+
+        last_error = None
+        for start_port in range(base_port, base_port + stride - port_count + 1):
+            sockets = []
+            try:
+                sockets = [self._reserve_port(address, start_port + offset) for offset in range(port_count)]
+                if start_port != base_port:
+                    logger.info(
+                        "Shifted vLLM replica %s port block from %s-%s to %s-%s because the earlier block was busy",
+                        self.replica_rank,
+                        base_port,
+                        base_port + port_count - 1,
+                        start_port,
+                        start_port + port_count - 1,
+                    )
+                dp_init_ports = [start_port + offset for offset in range(2, port_count)]
+                return (
+                    start_port,
+                    sockets[0],
+                    start_port + 1,
+                    sockets[1],
+                    dp_init_ports[0],
+                    sockets[2],
+                    dp_init_ports,
+                    sockets[2:],
+                )
+            except OSError as exc:
+                last_error = exc
+                for sock in sockets:
+                    sock.close()
+
+        raise OSError(
+            f"No free vLLM port block of {port_count} ports in replica slot {base_port}-{base_port + stride - 1}"
+        ) from last_error
 
     def get_master_address(self):
         """Get master address and port for data parallel.
@@ -181,6 +263,30 @@ class vLLMHttpServer:
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
+
+    def _release_reserved_port_sockets(self):
+        released_socks = set()
+        for sock_attr, port_attr in (
+            ("_master_sock", "_master_port"),
+            ("_dp_rpc_sock", "_dp_rpc_port"),
+            ("_dp_master_sock", "_dp_master_port"),
+        ):
+            sock = getattr(self, sock_attr, None)
+            if sock is None:
+                continue
+
+            port = getattr(self, port_attr, None)
+            sock.close()
+            released_socks.add(id(sock))
+            setattr(self, sock_attr, None)
+            logger.info("Released reserved vLLM port socket %s=%s", port_attr, port)
+
+        for port, sock in zip(getattr(self, "_dp_init_ports", []), getattr(self, "_dp_init_socks", [])):
+            if id(sock) in released_socks:
+                continue
+            sock.close()
+            logger.info("Released reserved vLLM DP init port socket=%s", port)
+        self._dp_init_socks = []
 
     @property
     def lora_as_adapter(self) -> bool:
@@ -233,6 +339,20 @@ class vLLMHttpServer:
             set_expandable_segments(True)
 
         quantization, hf_overrides = self._apply_quantization()
+        distributed_executor_backend = (
+            "uni"
+            if self.config.tensor_model_parallel_size == 1
+            and self.config.pipeline_model_parallel_size == 1
+            and self.config.data_parallel_size == 1
+            and self.nnodes == 1
+            else "mp"
+        )
+        logger.info(
+            "Using vLLM distributed_executor_backend=%s for replica_rank=%s node_rank=%s",
+            distributed_executor_backend,
+            self.replica_rank,
+            self.node_rank,
+        )
 
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
@@ -254,7 +374,7 @@ class vLLMHttpServer:
             "dtype": self.config.dtype,
             "load_format": self.config.load_format,
             "skip_tokenizer_init": False,
-            "distributed_executor_backend": "mp",
+            "distributed_executor_backend": distributed_executor_backend,
             "worker_extension_cls": self._get_worker_extension_cls(),
             "trust_remote_code": self.model_config.trust_remote_code,
             "max_model_len": self.config.max_model_len,
@@ -321,12 +441,9 @@ class vLLMHttpServer:
 
         args.update({"enable_expert_parallel": self.config.expert_parallel_size > 1})
 
-        # used for torch.distributed.init_process_group
         if self.nnodes > 1:
             args.update(
                 {
-                    "master_addr": self._master_address,
-                    "master_port": self._master_port,
                     "node_rank": self.node_rank,
                     "nnodes": self.nnodes,
                     "data_parallel_address": self._master_address,
@@ -383,10 +500,27 @@ class vLLMHttpServer:
             await self.run_headless(server_args)
 
     async def run_server(self, args: argparse.Namespace):
+        # vLLM 0.12 does not expose master_addr/master_port as serve CLI args
+        # for this path. Seed its env/config before engine creation so it does
+        # not select a random busy port for the internal TCPStore.
+        os.environ["VLLM_REPLICA_RANK"] = str(self.replica_rank)
+        os.environ["VLLM_EFFECTIVE_PORT_STRIDE"] = str(max(int(os.getenv("VLLM_PORT_STRIDE", "100")), 100))
+        if self._master_address is not None:
+            os.environ["VLLM_DP_MASTER_IP"] = str(self._master_address)
+        dp_init_ports = list(getattr(self, "_dp_init_ports", []) or [self._dp_master_port])
+        fixed_dp_port_list = list(reversed(dp_init_ports))
+        if self._dp_master_port is not None:
+            os.environ["VLLM_DP_MASTER_PORT"] = str(self._dp_master_port)
+        if fixed_dp_port_list:
+            os.environ["VLLM_DP_MASTER_PORT_LIST"] = ",".join(str(port) for port in fixed_dp_port_list)
+            os.environ["VLLM_DP_MASTER_PORT_INDEX"] = "0"
+
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
-        vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
+        vllm_config.parallel_config.data_parallel_master_ip = self._master_address
+        vllm_config.parallel_config.data_parallel_master_port = dp_init_ports[0]
+        vllm_config.parallel_config._data_parallel_master_port_list = fixed_dp_port_list
 
         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
         kwargs = {}
@@ -395,6 +529,7 @@ class vLLMHttpServer:
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
+        self._release_reserved_port_sockets()
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
         # Don't keep the dummy data in memory

@@ -214,6 +214,7 @@ def apply_if_ppl_rank_reward(
     # Only constraint-reward>0 rows receive the PPL rank reward, preserving the IF gate.
     # ``gate_scores`` is the original constraint reward snapshot (taken before any PPL shaping); when
     # bidirectional rewards are chained it keeps each direction from gating on the other's bonus.
+    # Only perfect IF rows receive the PPL rank reward, preserving the IF gate.
     if ppl_key not in batch.non_tensor_batch or "uid" not in batch.non_tensor_batch:
         return reward_tensor, {}
 
@@ -267,10 +268,10 @@ def apply_if_ppl_rank_reward(
         low_ppl_candidate_count += len(low_ppl_indices)
         high_ppl_candidate_count += len(high_ppl_indices)
         for idx in low_ppl_indices:
-            if gate_values[idx] > 0.0:
+            if float(base_scores[idx].detach().cpu()) == 1.0:
                 bonus[idx] += float(ppl_reward_coeff)
         for idx in high_ppl_indices:
-            if gate_values[idx] > 0.0:
+            if float(base_scores[idx].detach().cpu()) == 1.0:
                 bonus[idx] -= float(ppl_reward_coeff)
 
     base_reward_scores = base_scores.detach().float()
@@ -1715,6 +1716,15 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        if "acc" in reward_extra_infos_dict:
+                            if_constraint = np.asarray(reward_extra_infos_dict["acc"], dtype=np.float32)
+                            metrics.update(
+                                {
+                                    "if_constraint/acc/mean": float(np.mean(if_constraint)),
+                                    "if_constraint/acc/max": float(np.max(if_constraint)),
+                                    "if_constraint/acc/min": float(np.min(if_constraint)),
+                                }
+                            )
                         # ##6/3 ppl## Optional zero-reward handling for max_response_length-clipped rollouts.
                         reward_tensor, clipped_reward_metrics = apply_clipped_rollout_reward_mode(
                             batch, reward_tensor, clipped_rollout_mode

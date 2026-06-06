@@ -54,7 +54,7 @@ PY
 ########################### end NLTK data ###########################
 
 ########################### runtime selection (non-invasive) ###########################
-VERL_DIR=${VERL_DIR:-/NHNHOME/WORKSPACE/26msit001_T_A/IFIF/if-rlvr}
+VERL_DIR=${VERL_DIR:-/NHNHOME/26msit001_A/IFIF/if-rlvr}
 export PYTHONPATH="${VERL_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 IF_RLVR_DIR=${IF_RLVR_DIR:-${VERL_DIR}/if_rlvr}
 REWARD_FN_PATH="${IF_RLVR_DIR}/if_reward_fn.py"
@@ -88,22 +88,39 @@ actor_lr=${ACTOR_LR:-5e-7}
 kl_loss_coef=${KL_LOSS_COEF:-0.001}
 entropy_coeff=${ENTROPY_COEFF:-0}
 py_given_x_reward_coeff=${PY_GIVEN_X_REWARD_COEFF:-${PPL_REWARD_COEFF:-0.0}}  # ##6/3 ppl## p(y|x)
-px_given_y_reward_coeff=${PX_GIVEN_Y_REWARD_COEFF:-0.0}  # ##6/3 ppl## p(x|y)
-clipped_rollout_mode=${CLIPPED_ROLLOUT_MODE:-zero}  # ##6/3 ppl## use|zero|drop
+px_given_y_reward_coeff=${PX_GIVEN_Y_REWARD_COEFF:-0.1}  # ##6/3 ppl## p(x|y)
+clipped_rollout_mode=${CLIPPED_ROLLOUT_MODE:-use}  # ##6/3 ppl## use|zero|drop
 
 rollout_tp=${ROLLOUT_TP:-1}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.85}
 rollout_n=${ROLLOUT_N:-8}
 sp_size=${SP_SIZE:-1}
 
-total_epochs=${TOTAL_EPOCHS:-3}
-save_freq=${SAVE_FREQ:-50}
+total_epochs=${TOTAL_EPOCHS:-1}
+save_freq=${SAVE_FREQ:-25}
 test_freq=${TEST_FREQ:-1000}
 
 PROJECT_NAME=${PROJECT_NAME:-verl_if_rlvr}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_if_grpo_${INFER_BACKEND}_fsdp_think_${ENABLE_THINKING}_pyx_${py_given_x_reward_coeff}_pxy_${px_given_y_reward_coeff}_clip_${clipped_rollout_mode}}
 WANDB_ENTITY=${WANDB_ENTITY:-ifif}
 export WANDB_ENTITY
+
+if [[ -n "${DIST_INIT_METHOD:-}" && "${DIST_INIT_METHOD}" =~ ^tcp://([^:]+):([0-9]+)$ ]]; then
+    export MASTER_ADDR="${MASTER_ADDR:-${BASH_REMATCH[1]}}"
+    export MASTER_PORT="${MASTER_PORT:-${BASH_REMATCH[2]}}"
+fi
+
+# vLLM internally opens its own torch.distributed ports, separate from
+# DIST_INIT_METHOD. Pin them to a user-shiftable range so reruns can avoid
+# transient EADDRINUSE conflicts from previous jobs or neighboring runs.
+if [[ -z "${VLLM_MASTER_PORT_BASE:-}" && -n "${MASTER_PORT:-}" ]]; then
+    VLLM_MASTER_PORT_BASE=$((MASTER_PORT + 16000))
+    if (( VLLM_MASTER_PORT_BASE > 65000 )); then
+        VLLM_MASTER_PORT_BASE=$((MASTER_PORT + 1000))
+    fi
+    export VLLM_MASTER_PORT_BASE
+fi
+export VLLM_PORT_STRIDE="${VLLM_PORT_STRIDE:-100}"
 ########################### end user-adjustable ###########################
 
 ########################### derived defaults ###########################
