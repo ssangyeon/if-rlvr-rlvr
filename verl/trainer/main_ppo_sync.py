@@ -647,6 +647,15 @@ class PPOTrainer:
                 wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
                     OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
                 )
+        master_port_range = OmegaConf.select(self.config.trainer, "ray_worker_group_master_port_range")
+        if master_port_range is not None:
+            master_port_range = OmegaConf.to_container(master_port_range, resolve=True)
+            if not isinstance(master_port_range, list) or len(master_port_range) != 2:
+                raise ValueError(
+                    "trainer.ray_worker_group_master_port_range must be a two-item list, "
+                    f"got: {master_port_range}"
+                )
+            wg_kwargs["master_port_range"] = [int(master_port_range[0]), int(master_port_range[1])]
         wg_kwargs["device_name"] = self.config.trainer.device
         logger.info(f"worker group kwargs: {wg_kwargs}")
 

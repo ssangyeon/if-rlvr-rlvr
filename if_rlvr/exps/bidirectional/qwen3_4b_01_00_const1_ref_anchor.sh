@@ -54,7 +54,7 @@ PY
 ########################### end NLTK data ###########################
 
 ########################### runtime selection (non-invasive) ###########################
-VERL_DIR=${VERL_DIR:-/NHNHOME/WORKSPACE/26msit001_T_A/IFIF/if-rlvr}
+VERL_DIR=${VERL_DIR:-/NHNHOME/26msit001_A/IFIF/if-rlvr/}
 export PYTHONPATH="${VERL_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 IF_RLVR_DIR=${IF_RLVR_DIR:-${VERL_DIR}/if_rlvr}
 REWARD_FN_PATH="${IF_RLVR_DIR}/if_reward_fn.py"
@@ -87,21 +87,33 @@ log_prob_max_token_len_per_gpu=${LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-${ppo_max_token
 actor_lr=${ACTOR_LR:-5e-7}
 kl_loss_coef=${KL_LOSS_COEF:-0.001}
 entropy_coeff=${ENTROPY_COEFF:-0}
-py_given_x_reward_coeff=${PY_GIVEN_X_REWARD_COEFF:-${PPL_REWARD_COEFF:-0.0}}  # ##6/3 ppl## p(y|x)
-px_given_y_reward_coeff=${PX_GIVEN_Y_REWARD_COEFF:-0.1}  # ##6/3 ppl## p(x|y)
+py_given_x_reward_coeff=${PY_GIVEN_X_REWARD_COEFF:-${PPL_REWARD_COEFF:-0.1}}  # ##6/3 ppl## p(y|x)
+if_ppl_reward_strategy=${IF_PPL_REWARD_STRATEGY:-anchor}  # ##6/3 ppl## rank|anchor
+if_ref_ppl_gate=${IF_REF_PPL_GATE:-false}  # unused in anchor mode; lower gate is handled by anchor reward
+if_ref_ppl_gate_margin=${IF_REF_PPL_GATE_MARGIN:-0.0}
+if_ref_anchor_precompute=${IF_REF_ANCHOR_PRECOMPUTE:-true}
+if_ref_policy_anchor_ppl=${IF_REF_POLICY_ANCHOR_PPL:-true}
+if_ref_anchor_precompute_batch_size=${IF_REF_ANCHOR_PRECOMPUTE_BATCH_SIZE:-2048}
+agent_num_workers=${AGENT_NUM_WORKERS:-512}
+if_ref_anchor_cache_path=${IF_REF_ANCHOR_CACHE_PATH:-${CACHE_ROOT}/if_ref_anchor_qwen3_4b_const1_train_seed${IF_DATA_SEED}_val${IF_VAL_SIZE}_think${ENABLE_THINKING}.json}
+export IF_REF_PPL_BASELINE=${IF_REF_PPL_BASELINE:-0}
+export IF_REF_PPL_ANCHOR=${IF_REF_PPL_ANCHOR:-0}
+export IF_REF_VLLM_BASE_URL=${IF_REF_VLLM_BASE_URL:-}
+export IF_REF_VLLM_MODEL=${IF_REF_VLLM_MODEL:-Qwen/Qwen3-4B}
+px_given_y_reward_coeff=${PX_GIVEN_Y_REWARD_COEFF:-0.0}  # ##6/3 ppl## p(x|y)
 clipped_rollout_mode=${CLIPPED_ROLLOUT_MODE:-use}  # ##6/3 ppl## use|zero|drop
 
 rollout_tp=${ROLLOUT_TP:-1}
-rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.85}
+rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.9}
 rollout_n=${ROLLOUT_N:-8}
 sp_size=${SP_SIZE:-1}
 
-total_epochs=${TOTAL_EPOCHS:-1}
+total_epochs=${TOTAL_EPOCHS:-3}
 save_freq=${SAVE_FREQ:-25}
 test_freq=${TEST_FREQ:-1000}
 
 PROJECT_NAME=${PROJECT_NAME:-verl_if_rlvr}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_if_grpo_${INFER_BACKEND}_fsdp_think_${ENABLE_THINKING}_pyx_${py_given_x_reward_coeff}_pxy_${px_given_y_reward_coeff}_clip_${clipped_rollout_mode}_bsz_${train_batch_size}_const1only}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_if_grpo_${INFER_BACKEND}_fsdp_think_${ENABLE_THINKING}_pyx_anchor_${py_given_x_reward_coeff}_pxy_${px_given_y_reward_coeff}_clip_${clipped_rollout_mode}_bsz_${train_batch_size}_const1only_refanchor_precompute_refpolicy_qwen3_4b}
 WANDB_ENTITY=${WANDB_ENTITY:-ifif}
 export WANDB_ENTITY
 ########################### end user-adjustable ###########################
@@ -220,6 +232,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.n=${rollout_n}
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${log_prob_max_token_len_per_gpu}
+    actor_rollout_ref.rollout.agent.num_workers=${agent_num_workers}
 )
 
 REF=(
@@ -233,6 +246,13 @@ REWARD=(
     custom_reward_function.name=compute_score
     "+if_py_given_x_reward_coeff=${py_given_x_reward_coeff}"  # ##6/3 ppl## p(y|x)
     "+if_px_given_y_reward_coeff=${px_given_y_reward_coeff}"  # ##6/3 ppl## p(x|y)
+    "+if_ppl_reward_strategy=${if_ppl_reward_strategy}"
+    "+if_ref_anchor_precompute=${if_ref_anchor_precompute}"
+    "+if_ref_policy_anchor_ppl=${if_ref_policy_anchor_ppl}"
+    "+if_ref_anchor_precompute_batch_size=${if_ref_anchor_precompute_batch_size}"
+    "+if_ref_anchor_cache_path=${if_ref_anchor_cache_path}"
+    "+if_ref_ppl_gate=${if_ref_ppl_gate}"
+    "+if_ref_ppl_gate_margin=${if_ref_ppl_gate_margin}"
     "+clipped_rollout_mode=${clipped_rollout_mode}"  # ##6/3 ppl##
 )
 
@@ -246,6 +266,8 @@ TRAINER=(
     trainer.save_freq=${save_freq}
     trainer.test_freq=${test_freq}
     trainer.total_epochs=${total_epochs}
+    trainer.val_before_train=False
+    trainer.resume_mode=disable
 )
 
 ########################### launch ###########################

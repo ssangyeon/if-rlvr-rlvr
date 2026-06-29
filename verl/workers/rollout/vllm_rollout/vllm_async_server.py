@@ -339,6 +339,8 @@ class vLLMHttpServer:
             set_expandable_segments(True)
 
         quantization, hf_overrides = self._apply_quantization()
+        hf_overrides = self._merge_hf_overrides(engine_kwargs.pop("hf_overrides", None), hf_overrides)
+        self._maybe_force_gemma4_text_only_hf_overrides(hf_overrides)
         distributed_executor_backend = (
             "uni"
             if self.config.tensor_model_parallel_size == 1
@@ -970,6 +972,42 @@ class vLLMHttpServer:
     def _preprocess_engine_kwargs(self, engine_kwargs: dict) -> None:
         """Mutate engine_kwargs in-place before the CLI args dict is built. No-op by default."""
         pass
+
+    def _merge_hf_overrides(self, user_hf_overrides: Any, hf_overrides: dict) -> dict:
+        """Merge user-supplied vLLM hf_overrides with overrides created by verl."""
+        merged = dict(hf_overrides or {})
+        if user_hf_overrides:
+            merged.update(dict(user_hf_overrides))
+        return merged
+
+    def _maybe_force_gemma4_text_only_hf_overrides(self, hf_overrides: dict) -> None:
+        """Use the text-only Gemma4 vLLM model for text rollout/precompute jobs.
+
+        Gemma4 instruction checkpoints advertise Gemma4ForConditionalGeneration,
+        which makes vLLM initialize the vision/audio wrapper even for text-only
+        rollouts. The text stack can be loaded directly via Gemma4ForCausalLM;
+        vLLM's loader maps the ConditionalGeneration checkpoint keys onto it.
+        """
+        env_value = os.getenv("VERL_VLLM_GEMMA4_TEXT_ONLY", "1").lower()
+        if env_value in {"0", "false", "no", "off"}:
+            return
+
+        hf_config = self.model_config.hf_config
+        if not getattr(hf_config, "model_type", None) == "gemma4":
+            return
+
+        architectures = getattr(hf_config, "architectures", None) or []
+        if "Gemma4ForConditionalGeneration" not in architectures:
+            return
+
+        if "architectures" in hf_overrides:
+            return
+
+        hf_overrides["architectures"] = ["Gemma4ForCausalLM"]
+        logger.info(
+            "Forcing Gemma4 vLLM rollout to text-only architecture "
+            "Gemma4ForCausalLM. Set VERL_VLLM_GEMMA4_TEXT_ONLY=0 to disable."
+        )
 
     def _get_override_generation_config(self) -> dict:
         """Return the override_generation_config dict."""

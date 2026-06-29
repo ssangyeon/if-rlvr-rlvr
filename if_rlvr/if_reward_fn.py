@@ -37,6 +37,13 @@ if _THIS_DIR not in sys.path:
 from ifeval_oi.verifier import score_ifeval  # noqa: E402  (after sys.path bootstrap)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, verification_reward=1.0, **kwargs):
     """verl ``custom_reward_function`` entry point.
 
@@ -54,5 +61,6 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, veri
     Returns:
         dict with mandatory ``"score"`` key (+ ``"acc"`` = the raw fraction, for logging).
     """
-    score = score_ifeval(solution_str, ground_truth)
+    require_think_end = _env_bool("IF_REQUIRE_THINK_END_FOR_REWARD", False)
+    score = score_ifeval(solution_str, ground_truth, require_think_end=require_think_end)
     return {"score": float(verification_reward) * score, "acc": score}

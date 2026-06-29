@@ -21,6 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import math
 import os
+import tempfile
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -64,6 +65,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -136,6 +138,8 @@ def compute_response_mask(data: DataProto):
 
 # ##6/3 ppl## How to handle rollouts that reach max_response_length: use, zero reward, or drop.
 _CLIPPED_ROLLOUT_MODES = {"use", "zero", "drop"}
+_IF_PPL_RANK_REWARD_MODES = {"both", "high_only"}
+_IF_PPL_ANCHOR_REWARD_MODES = {"both", "no_lower_zero", "lower_zero_only"}
 
 
 def normalize_clipped_rollout_mode(mode: Any) -> str:
@@ -146,6 +150,45 @@ def normalize_clipped_rollout_mode(mode: Any) -> str:
     if normalized not in _CLIPPED_ROLLOUT_MODES:
         raise ValueError(f"clipped_rollout_mode must be one of {_CLIPPED_ROLLOUT_MODES}, got: {mode}")
     return normalized
+
+
+def normalize_if_ppl_rank_reward_mode(mode: Any) -> str:
+    normalized = str(mode or "both").strip().lower().replace("-", "_")
+    aliases = {"symmetric": "both", "bidirectional": "both", "penalty_only": "high_only", "high": "high_only"}
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in _IF_PPL_RANK_REWARD_MODES:
+        raise ValueError(f"if_ppl_rank_reward_mode must be one of {_IF_PPL_RANK_REWARD_MODES}, got: {mode}")
+    return normalized
+
+
+def normalize_if_ppl_anchor_reward_mode(mode: Any) -> str:
+    normalized = str(mode or "both").strip().lower().replace("-", "_")
+    aliases = {
+        "full": "both",
+        "default": "both",
+        "no_low_gate": "no_lower_zero",
+        "no_lower_gate": "no_lower_zero",
+        "upper_only": "no_lower_zero",
+        "no_upper_bonus": "lower_zero_only",
+        "zero_only": "lower_zero_only",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in _IF_PPL_ANCHOR_REWARD_MODES:
+        raise ValueError(f"if_ppl_anchor_reward_mode must be one of {_IF_PPL_ANCHOR_REWARD_MODES}, got: {mode}")
+    return normalized
+
+
+def normalize_bool_config(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def get_clipped_rollout_mask(batch: DataProto) -> torch.Tensor:
@@ -209,14 +252,20 @@ def apply_if_ppl_rank_reward(
     nll_key: str = "p_y_given_x_nll",
     token_count_key: str = "p_y_given_x_token_count",
     gate_scores: torch.Tensor | None = None,
+    rank_reward_mode: Any = "both",
+    ref_nll_key: str | None = None,
+    ref_token_count_key: str | None = None,
+    ref_ppl_gate_enabled: bool = False,
+    ref_ppl_gate_margin: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     # ##6/3 ppl## Reward low-PPL and penalize high-PPL samples per prompt.
-    # Only constraint-reward>0 rows receive the PPL rank reward, preserving the IF gate.
+    # In high_only mode, keep the high-PPL penalty while suppressing the low-PPL bonus.
     # ``gate_scores`` is the original constraint reward snapshot (taken before any PPL shaping); when
     # bidirectional rewards are chained it keeps each direction from gating on the other's bonus.
-    # Only perfect IF rows receive the PPL rank reward, preserving the IF gate.
+    # Only rows with positive IF reward receive the PPL rank reward, preserving the IF gate.
     if ppl_key not in batch.non_tensor_batch or "uid" not in batch.non_tensor_batch:
         return reward_tensor, {}
+    rank_reward_mode = normalize_if_ppl_rank_reward_mode(rank_reward_mode)
 
     ppls = []
     for value in batch.non_tensor_batch[ppl_key]:
@@ -239,6 +288,21 @@ def apply_if_ppl_rank_reward(
         except (TypeError, ValueError):
             token_counts.append(0)
 
+    ref_nlls = []
+    if ref_nll_key:
+        for value in batch.non_tensor_batch.get(ref_nll_key, []):
+            try:
+                ref_nlls.append(float(value))
+            except (TypeError, ValueError):
+                ref_nlls.append(float("inf"))
+    ref_token_counts = []
+    if ref_token_count_key:
+        for value in batch.non_tensor_batch.get(ref_token_count_key, []):
+            try:
+                ref_token_counts.append(int(value))
+            except (TypeError, ValueError):
+                ref_token_counts.append(0)
+
     base_scores = reward_tensor.sum(dim=-1)
     # ##6/3 ppl## Gate on the original constraint reward (snapshot) so chained directions don't see
     # each other's bonus. Falls back to the running reward when no snapshot is given (single-direction
@@ -256,23 +320,46 @@ def apply_if_ppl_rank_reward(
     corpus_ppl = math.exp(total_nll / total_tokens) if total_tokens > 0 else 0.0
     bonus = torch.zeros_like(base_scores, dtype=reward_tensor.dtype)
     uids = batch.non_tensor_batch["uid"]
-    top_k = max(int(rollout_n or 0) // 2, 1)
+    top_k = 0
+    high_k = max(int(rollout_n or 0) // 4, 1)
     low_ppl_candidate_count = 0
     high_ppl_candidate_count = 0
+    ref_ppl_gate_blocked_mask = np.zeros(len(ppls), dtype=bool)
+    if ref_ppl_gate_enabled:
+        for idx in range(len(ppls)):
+            policy_nll = nlls[idx] if idx < len(nlls) else float("inf")
+            policy_tokens = token_counts[idx] if idx < len(token_counts) else 0
+            ref_nll = ref_nlls[idx] if idx < len(ref_nlls) else float("inf")
+            ref_tokens = ref_token_counts[idx] if idx < len(ref_token_counts) else 0
+            ref_ppl_gate_blocked_mask[idx] = (
+                float(gate_values[idx]) > 0.0
+                and np.isfinite(policy_nll)
+                and np.isfinite(ref_nll)
+                and policy_tokens > 0
+                and ref_tokens > 0
+                and (policy_nll / policy_tokens) < (ref_nll / ref_tokens) - ref_ppl_gate_margin
+            )
+    ref_ppl_gate_blocked_count = int(ref_ppl_gate_blocked_mask.sum())
 
     for uid in np.unique(uids):
         indices = [idx for idx, row_uid in enumerate(uids) if row_uid == uid and finite_ppl_mask[idx]]
         indices.sort(key=lambda idx: ppls[idx])
         low_ppl_indices = indices[:top_k]
-        high_ppl_indices = indices[-top_k:]
+        high_ppl_indices = indices[-high_k:]
         low_ppl_candidate_count += len(low_ppl_indices)
         high_ppl_candidate_count += len(high_ppl_indices)
         for idx in low_ppl_indices:
-            if float(base_scores[idx].detach().cpu()) == 1.0:
+            if rank_reward_mode == "both" and float(gate_values[idx]) > 0.0:
                 bonus[idx] += float(ppl_reward_coeff)
         for idx in high_ppl_indices:
-            if float(base_scores[idx].detach().cpu()) == 1.0:
+            if float(gate_values[idx]) > 0.0:
                 bonus[idx] -= float(ppl_reward_coeff)
+
+    if ref_ppl_gate_blocked_count > 0:
+        blocked = torch.from_numpy(ref_ppl_gate_blocked_mask).to(device=bonus.device)
+        bonus[blocked] = -base_scores[blocked]
+
+
 
     base_reward_scores = base_scores.detach().float()
     ppl_rank_reward_scores = bonus.detach().float()
@@ -282,6 +369,12 @@ def apply_if_ppl_rank_reward(
         f"{metric_prefix}/base_reward/max": float(base_reward_scores.max().cpu().item()),
         f"{metric_prefix}/base_reward/min": float(base_reward_scores.min().cpu().item()),
         f"{metric_prefix}/reward_coeff": float(ppl_reward_coeff),
+        f"{metric_prefix}/reward_mode_both": float(rank_reward_mode == "both"),
+        f"{metric_prefix}/reward_mode_high_only": float(rank_reward_mode == "high_only"),
+        f"{metric_prefix}/ref_ppl_gate_enabled": float(ref_ppl_gate_enabled),
+        f"{metric_prefix}/ref_ppl_gate_margin": float(ref_ppl_gate_margin),
+        f"{metric_prefix}/ref_ppl_gate_blocked_count": float(ref_ppl_gate_blocked_count),
+        f"{metric_prefix}/ref_ppl_gate_zeroed_count": float(ref_ppl_gate_blocked_count),
         f"{metric_prefix}/rank_reward/mean": float(ppl_rank_reward_scores.mean().cpu().item()),
         f"{metric_prefix}/rank_reward/max": float(ppl_rank_reward_scores.max().cpu().item()),
         f"{metric_prefix}/rank_reward/min": float(ppl_rank_reward_scores.min().cpu().item()),
@@ -294,6 +387,7 @@ def apply_if_ppl_rank_reward(
         metrics = {
             f"{metric_prefix}/finite_count": float(finite_ppl_mask.sum()),
             f"{metric_prefix}/rank_k": float(top_k),
+        f"{metric_prefix}/high_rank_k": float(high_k),
             f"{metric_prefix}/low_ppl_candidate_count": float(low_ppl_candidate_count),
             f"{metric_prefix}/high_ppl_candidate_count": float(high_ppl_candidate_count),
             f"{metric_prefix}/positive_bonus_count": 0.0,
@@ -313,12 +407,147 @@ def apply_if_ppl_rank_reward(
     metrics = {
         f"{metric_prefix}/finite_count": float(len(finite_ppls)),
         f"{metric_prefix}/rank_k": float(top_k),
+        f"{metric_prefix}/high_rank_k": float(high_k),
         f"{metric_prefix}/low_ppl_candidate_count": float(low_ppl_candidate_count),
         f"{metric_prefix}/high_ppl_candidate_count": float(high_ppl_candidate_count),
         f"{metric_prefix}/positive_bonus_count": float(torch.count_nonzero(bonus > 0).item()),
         f"{metric_prefix}/negative_bonus_count": float(torch.count_nonzero(bonus < 0).item()),
         f"{metric_prefix}/corpus_ppl": float(corpus_ppl),
         **reward_split_metrics,
+    }
+    return updated_reward, metrics
+
+
+def apply_if_ppl_anchor_reward(
+    batch: DataProto,
+    reward_tensor: torch.Tensor,
+    ppl_reward_coeff: float = 1.0,
+    metric_prefix: str = "if_p_y_given_x_anchor",
+    policy_nll_key: str = "p_y_given_x_nll",
+    policy_token_count_key: str = "p_y_given_x_token_count",
+    ref0_nll_key: str = "p_y_ref_given_x_nll",
+    ref0_token_count_key: str = "p_y_ref_given_x_token_count",
+    ref1_nll_key: str = "p_y_ref_xc_given_x_nll",
+    ref1_token_count_key: str = "p_y_ref_xc_given_x_token_count",
+    gate_scores: torch.Tensor | None = None,
+    anchor_reward_mode: Any = "both",
+) -> tuple[torch.Tensor, dict[str, float]]:
+    # ##6/3 ppl## Anchor reward: zero reward below x-only ref PPL, bonus inside [ref0, ref1].
+    anchor_reward_mode = normalize_if_ppl_anchor_reward_mode(anchor_reward_mode)
+    required = [
+        policy_nll_key,
+        policy_token_count_key,
+        ref0_nll_key,
+        ref0_token_count_key,
+        ref1_nll_key,
+        ref1_token_count_key,
+    ]
+    if any(key not in batch.non_tensor_batch for key in required):
+        return reward_tensor, {}
+
+    def to_float_list(key: str) -> list[float]:
+        values = []
+        for value in batch.non_tensor_batch.get(key, []):
+            try:
+                values.append(float(value))
+            except (TypeError, ValueError):
+                values.append(float("inf"))
+        return values
+
+    def to_int_list(key: str) -> list[int]:
+        values = []
+        for value in batch.non_tensor_batch.get(key, []):
+            try:
+                values.append(int(value))
+            except (TypeError, ValueError):
+                values.append(0)
+        return values
+
+    policy_nlls = to_float_list(policy_nll_key)
+    ref0_nlls = to_float_list(ref0_nll_key)
+    ref1_nlls = to_float_list(ref1_nll_key)
+    policy_tokens = to_int_list(policy_token_count_key)
+    ref0_tokens = to_int_list(ref0_token_count_key)
+    ref1_tokens = to_int_list(ref1_token_count_key)
+
+    base_scores = reward_tensor.sum(dim=-1)
+    gate_source = base_scores if gate_scores is None else gate_scores
+    gate_values = gate_source.detach().to(device="cpu", dtype=torch.float64).tolist()
+    bonus = torch.zeros_like(base_scores, dtype=reward_tensor.dtype)
+
+    eligible_count = 0
+    lower_zero_count = 0
+    interval_bonus_count = 0
+    above_ref1_count = 0
+    invalid_anchor_count = 0
+    finite_policy_count = 0
+    finite_ref0_count = 0
+    finite_ref1_count = 0
+
+    for idx in range(len(gate_values)):
+        policy_nll = policy_nlls[idx] if idx < len(policy_nlls) else float("inf")
+        ref0_nll = ref0_nlls[idx] if idx < len(ref0_nlls) else float("inf")
+        ref1_nll = ref1_nlls[idx] if idx < len(ref1_nlls) else float("inf")
+        policy_count = policy_tokens[idx] if idx < len(policy_tokens) else 0
+        ref0_count = ref0_tokens[idx] if idx < len(ref0_tokens) else 0
+        ref1_count = ref1_tokens[idx] if idx < len(ref1_tokens) else 0
+        has_policy = np.isfinite(policy_nll) and policy_count > 0
+        has_ref0 = np.isfinite(ref0_nll) and ref0_count > 0
+        has_ref1 = np.isfinite(ref1_nll) and ref1_count > 0
+        finite_policy_count += int(has_policy)
+        finite_ref0_count += int(has_ref0)
+        finite_ref1_count += int(has_ref1)
+        if float(gate_values[idx]) <= 0.0 or not (has_policy and has_ref0 and has_ref1):
+            continue
+        eligible_count += 1
+        policy_mean_nll = policy_nll / policy_count
+        ref0_mean_nll = ref0_nll / ref0_count
+        ref1_mean_nll = ref1_nll / ref1_count
+        if anchor_reward_mode != "no_lower_zero" and policy_mean_nll < ref0_mean_nll:
+            bonus[idx] = -base_scores[idx]
+            lower_zero_count += 1
+        elif anchor_reward_mode != "lower_zero_only" and ref1_mean_nll >= ref0_mean_nll and policy_mean_nll <= ref1_mean_nll:
+            bonus[idx] += float(ppl_reward_coeff)
+            interval_bonus_count += 1
+        else:
+            above_ref1_count += int(ref1_mean_nll >= ref0_mean_nll and policy_mean_nll > ref1_mean_nll)
+            invalid_anchor_count += int(ref1_mean_nll < ref0_mean_nll)
+
+    updated_reward = reward_tensor
+    if torch.count_nonzero(bonus).item() > 0:
+        updated_reward = reward_tensor.clone()
+        response_mask = batch.batch["response_mask"]
+        last_response_positions = (response_mask.sum(dim=-1).long() - 1).clamp_min(0)
+        row_indices = torch.arange(updated_reward.size(0), device=updated_reward.device)
+        updated_reward[row_indices, last_response_positions] += bonus.to(updated_reward.device)
+
+    base_reward_scores = base_scores.detach().float()
+    anchor_reward_scores = bonus.detach().float()
+    composed_reward_scores = base_reward_scores + anchor_reward_scores
+    metrics = {
+        f"{metric_prefix}/reward_coeff": float(ppl_reward_coeff),
+        f"{metric_prefix}/reward_mode_both": float(anchor_reward_mode == "both"),
+        f"{metric_prefix}/reward_mode_no_lower_zero": float(anchor_reward_mode == "no_lower_zero"),
+        f"{metric_prefix}/reward_mode_lower_zero_only": float(anchor_reward_mode == "lower_zero_only"),
+        f"{metric_prefix}/eligible_count": float(eligible_count),
+        f"{metric_prefix}/finite_policy_count": float(finite_policy_count),
+        f"{metric_prefix}/finite_ref0_count": float(finite_ref0_count),
+        f"{metric_prefix}/finite_ref1_count": float(finite_ref1_count),
+        f"{metric_prefix}/lower_zero_count": float(lower_zero_count),
+        f"{metric_prefix}/interval_bonus_count": float(interval_bonus_count),
+        f"{metric_prefix}/above_ref1_count": float(above_ref1_count),
+        f"{metric_prefix}/invalid_anchor_count": float(invalid_anchor_count),
+        f"{metric_prefix}/positive_bonus_count": float(torch.count_nonzero(bonus > 0).item()),
+        f"{metric_prefix}/negative_bonus_count": float(torch.count_nonzero(bonus < 0).item()),
+        f"{metric_prefix}/base_reward/mean": float(base_reward_scores.mean().cpu().item()),
+        f"{metric_prefix}/base_reward/max": float(base_reward_scores.max().cpu().item()),
+        f"{metric_prefix}/base_reward/min": float(base_reward_scores.min().cpu().item()),
+        f"{metric_prefix}/anchor_reward/mean": float(anchor_reward_scores.mean().cpu().item()),
+        f"{metric_prefix}/anchor_reward/max": float(anchor_reward_scores.max().cpu().item()),
+        f"{metric_prefix}/anchor_reward/min": float(anchor_reward_scores.min().cpu().item()),
+        f"{metric_prefix}/composed_reward/mean": float(composed_reward_scores.mean().cpu().item()),
+        f"{metric_prefix}/composed_reward/max": float(composed_reward_scores.max().cpu().item()),
+        f"{metric_prefix}/composed_reward/min": float(composed_reward_scores.min().cpu().item()),
     }
     return updated_reward, metrics
 
@@ -762,7 +991,7 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        reward_keys = set({"data_source", "reward_model", "extra_info", "index", "uid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []
@@ -1045,6 +1274,15 @@ class RayPPOTrainer:
                 wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
                     OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
                 )
+        master_port_range = OmegaConf.select(self.config.trainer, "ray_worker_group_master_port_range")
+        if master_port_range is not None:
+            master_port_range = OmegaConf.to_container(master_port_range, resolve=True)
+            if not isinstance(master_port_range, list) or len(master_port_range) != 2:
+                raise ValueError(
+                    "trainer.ray_worker_group_master_port_range must be a two-item list, "
+                    f"got: {master_port_range}"
+                )
+            wg_kwargs["master_port_range"] = [int(master_port_range[0]), int(master_port_range[1])]
         wg_kwargs["device_name"] = self.device_name
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
@@ -1442,6 +1680,502 @@ class RayPPOTrainer:
 
         return ref_log_prob
 
+    def _coerce_token_ids(self, value) -> list[int]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return self.tokenizer.encode(value, add_special_tokens=False)
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, int):
+            return [int(value)]
+
+        result = []
+        values = list(value)
+        if values and all(isinstance(item, str) for item in values):
+            return self.tokenizer.encode("".join(values), add_special_tokens=False)
+        for item in values:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                result.extend(self.tokenizer.encode(item, add_special_tokens=False))
+            elif hasattr(item, "tolist"):
+                result.extend(self._coerce_token_ids(item.tolist()))
+            elif isinstance(item, (list, tuple)):
+                result.extend(self._coerce_token_ids(item))
+            else:
+                result.append(int(item))
+        return result
+
+    def _build_ref_policy_scoring_batch(
+        self, prefixes: list[list[int]], continuations: list[list[int]]
+    ) -> tuple[DataProto | None, torch.Tensor | None]:
+        valid_rows = [idx for idx, (prefix, continuation) in enumerate(zip(prefixes, continuations, strict=False)) if prefix and continuation]
+        if not valid_rows:
+            return None, None
+        selected_prefixes = [prefixes[idx] for idx in valid_rows]
+        selected_continuations = [continuations[idx] for idx in valid_rows]
+        if self.ref_in_actor:
+            ref_dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        else:
+            ref_dp_size = self._get_dp_size(self.ref_policy_wg, "ref")
+        if ref_dp_size > 1:
+            pad_count = (-len(selected_prefixes)) % ref_dp_size
+            if pad_count:
+                selected_prefixes.extend([selected_prefixes[-1]] * pad_count)
+                selected_continuations.extend([selected_continuations[-1]] * pad_count)
+        max_prompt = int(self.config.actor_rollout_ref.rollout.prompt_length)
+        max_response = int(self.config.actor_rollout_ref.rollout.response_length)
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+
+        prompt_tensors = []
+        response_tensors = []
+        prompt_masks = []
+        response_masks = []
+        for prefix, continuation in zip(selected_prefixes, selected_continuations, strict=True):
+            prefix = self._coerce_token_ids(prefix)[-max_prompt:]
+            continuation = self._coerce_token_ids(continuation)[:max_response]
+            prompt_pad = [pad_id] * (max_prompt - len(prefix)) + prefix
+            response_pad = continuation + [pad_id] * (max_response - len(continuation))
+            prompt_tensors.append(torch.tensor(prompt_pad, dtype=torch.long))
+            response_tensors.append(torch.tensor(response_pad, dtype=torch.long))
+            prompt_masks.append(torch.tensor([0] * (max_prompt - len(prefix)) + [1] * len(prefix), dtype=torch.long))
+            response_masks.append(torch.tensor([1] * len(continuation) + [0] * (max_response - len(continuation)), dtype=torch.long))
+
+        prompts = torch.stack(prompt_tensors, dim=0)
+        responses = torch.stack(response_tensors, dim=0)
+        prompt_attention = torch.stack(prompt_masks, dim=0)
+        response_mask = torch.stack(response_masks, dim=0)
+        attention_mask = torch.cat([prompt_attention, response_mask], dim=-1)
+        input_ids = torch.cat([prompts, responses], dim=-1)
+        position_ids = compute_position_id_with_mask(attention_mask)
+        scoring_batch = DataProto.from_dict(
+            tensors={
+                "prompts": prompts,
+                "responses": responses,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "response_mask": response_mask,
+                "temperature": torch.ones(prompts.shape[0], dtype=torch.float32),
+            }
+        )
+        return scoring_batch, torch.tensor(valid_rows, dtype=torch.long)
+
+    def _score_continuations_with_ref_policy(
+        self, prefixes: list[list[int]], continuations: list[list[int]]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        size = len(prefixes)
+        nlls = np.full(size, np.inf, dtype=np.float64)
+        token_counts = np.zeros(size, dtype=np.int64)
+        ppls = np.full(size, np.inf, dtype=np.float64)
+        scoring_batch, valid_rows = self._build_ref_policy_scoring_batch(prefixes, continuations)
+        if scoring_batch is None or valid_rows is None:
+            return nlls, token_counts, ppls
+        ref_log_prob = self._compute_ref_log_prob(scoring_batch)
+        log_probs = ref_log_prob.batch["ref_log_prob"].detach().cpu()
+        response_mask = scoring_batch.batch["response_mask"].detach().cpu().bool()
+        row_nlls = -(log_probs * response_mask.float()).sum(dim=-1).numpy()
+        row_counts = response_mask.sum(dim=-1).numpy().astype(np.int64)
+        for local_idx, original_idx in enumerate(valid_rows.tolist()):
+            count = int(row_counts[local_idx])
+            if count <= 0:
+                continue
+            nll = float(row_nlls[local_idx])
+            nlls[original_idx] = nll
+            token_counts[original_idx] = count
+            ppls[original_idx] = math.exp(nll / count)
+        return nlls, token_counts, ppls
+
+    def _compute_anchor_ppl_with_ref_policy(self, batch: DataProto) -> dict[str, float]:
+        if not normalize_bool_config(self.config.get("if_ref_policy_anchor_ppl", False)):
+            return {}
+        required = ["ppl_x_prompt_ids", "ppl_y_final_answer_ids"]
+        if any(key not in batch.non_tensor_batch for key in required):
+            return {"if_ref_policy_anchor_ppl/missing_fields": 1.0}
+
+        prefixes = [list(ids or []) for ids in batch.non_tensor_batch["ppl_x_prompt_ids"]]
+        policy_y = [list(ids or []) for ids in batch.non_tensor_batch["ppl_y_final_answer_ids"]]
+        metrics: dict[str, float] = {"if_ref_policy_anchor_ppl/enabled": 1.0}
+
+        def has_cached_scores(prefix: str) -> bool:
+            return (
+                f"{prefix}_nll" in batch.non_tensor_batch
+                and f"{prefix}_token_count" in batch.non_tensor_batch
+                and f"{prefix}_ppl" in batch.non_tensor_batch
+            )
+
+        def log_cached_score_metrics(prefix: str) -> None:
+            nlls = np.asarray([float(value) for value in batch.non_tensor_batch.get(f"{prefix}_nll", [])], dtype=np.float64)
+            token_counts = np.asarray(
+                [int(value) for value in batch.non_tensor_batch.get(f"{prefix}_token_count", [])], dtype=np.int64
+            )
+            finite = np.isfinite(nlls) & (token_counts > 0)
+            metrics[f"if_ref_policy_anchor_ppl/{prefix}/finite_count"] = float(finite.sum())
+            metrics[f"if_ref_policy_anchor_ppl/{prefix}/from_cache"] = 1.0
+            if finite.any():
+                metrics[f"if_ref_policy_anchor_ppl/{prefix}/corpus_ppl"] = float(
+                    math.exp(float(nlls[finite].sum()) / int(token_counts[finite].sum()))
+                )
+
+        metric_specs = [("p_y_given_x", policy_y)]
+        if has_cached_scores("p_y_ref_given_x"):
+            log_cached_score_metrics("p_y_ref_given_x")
+        elif "ppl_y_ref0_ids" in batch.non_tensor_batch:
+            ref0_y = [list(ids or []) for ids in batch.non_tensor_batch["ppl_y_ref0_ids"]]
+            metric_specs.append(("p_y_ref_given_x", ref0_y))
+        else:
+            metrics["if_ref_policy_anchor_ppl/p_y_ref_given_x/missing_cache"] = 1.0
+
+        if has_cached_scores("p_y_ref_xc_given_x"):
+            log_cached_score_metrics("p_y_ref_xc_given_x")
+        elif "ppl_y_ref1_ids" in batch.non_tensor_batch:
+            ref1_y = [list(ids or []) for ids in batch.non_tensor_batch["ppl_y_ref1_ids"]]
+            metric_specs.append(("p_y_ref_xc_given_x", ref1_y))
+        else:
+            metrics["if_ref_policy_anchor_ppl/p_y_ref_xc_given_x/missing_cache"] = 1.0
+
+        for prefix, continuations in metric_specs:
+            nlls, token_counts, ppls = self._score_continuations_with_ref_policy(prefixes, continuations)
+            batch.non_tensor_batch[f"{prefix}_nll"] = nlls.astype(object)
+            batch.non_tensor_batch[f"{prefix}_token_count"] = token_counts.astype(object)
+            batch.non_tensor_batch[f"{prefix}_ppl"] = ppls.astype(object)
+            finite = np.isfinite(ppls)
+            metrics[f"if_ref_policy_anchor_ppl/{prefix}/finite_count"] = float(finite.sum())
+            metrics[f"if_ref_policy_anchor_ppl/{prefix}/from_cache"] = 0.0
+            finite_for_corpus = np.isfinite(nlls) & (token_counts > 0)
+            if finite_for_corpus.any():
+                metrics[f"if_ref_policy_anchor_ppl/{prefix}/corpus_ppl"] = float(
+                    math.exp(float(nlls[finite_for_corpus].sum()) / int(token_counts[finite_for_corpus].sum()))
+                )
+        return metrics
+
+    def _extract_anchor_answer_ids(self, output: DataProto) -> list[list[int]]:
+        if "if_final_answer_ids" in output.non_tensor_batch:
+            result = []
+            for ids in output.non_tensor_batch["if_final_answer_ids"]:
+                if ids is None:
+                    result.append([])
+                elif isinstance(ids, str):
+                    result.append(self.tokenizer.encode(ids, add_special_tokens=False))
+                else:
+                    result.append([int(token_id) for token_id in list(ids)])
+            return result
+        responses = output.batch["responses"].detach().cpu()
+        response_mask = output.batch["response_mask"].detach().cpu().bool()
+        result = []
+        for row, mask in zip(responses, response_mask, strict=True):
+            result.append(row[mask].tolist())
+        return result
+
+    def _extract_anchor_vllm_scores(
+        self, output: DataProto, size: int, metric_prefix: str = "p_y_given_x"
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        required = [f"{metric_prefix}_nll", f"{metric_prefix}_token_count", f"{metric_prefix}_ppl"]
+        missing = [key for key in required if key not in output.non_tensor_batch]
+        if missing:
+            raise RuntimeError(
+                "IF ref anchor precompute expected vLLM prompt-logprob scores from the agent loop, "
+                f"but missing fields: {missing}"
+            )
+        nlls = np.asarray([float(value) for value in output.non_tensor_batch[f"{metric_prefix}_nll"][:size]], dtype=np.float64)
+        token_counts = np.asarray(
+            [int(value) for value in output.non_tensor_batch[f"{metric_prefix}_token_count"][:size]], dtype=np.int64
+        )
+        ppls = np.asarray([float(value) for value in output.non_tensor_batch[f"{metric_prefix}_ppl"][:size]], dtype=np.float64)
+        return nlls, token_counts, ppls
+
+    def _make_anchor_generation_batch(self, rows: list[dict], prompt_key: str) -> DataProto:
+        dummy = torch.stack([row["dummy_tensor"] for row in rows], dim=0)
+        raw_prompts = []
+        ppl_prompts = []
+        indices = []
+        for row in rows:
+            raw_prompts.append(row[prompt_key])
+            ppl_prompts.append(row.get("ppl_prompt"))
+            indices.append(row.get("index", 0))
+        return DataProto.from_single_dict(
+            {
+                "dummy_tensor": dummy,
+                "raw_prompt": np.array(raw_prompts, dtype=object),
+                "ppl_prompt": np.array(ppl_prompts, dtype=object),
+                "index": np.array(indices, dtype=object),
+                "__if_anchor_precompute__": np.array([True] * len(rows), dtype=object),
+                "__skip_compute_score__": np.array([True] * len(rows), dtype=object),
+            }
+        )
+
+    def _if_ref_anchor_cache_metadata(self) -> dict[str, Any]:
+        data_cfg = self.config.data
+        return {
+            "version": 2,
+            "model_path": str(self.config.actor_rollout_ref.model.path),
+            "tokenizer_class": self.tokenizer.__class__.__name__,
+            "train_files": list(data_cfg.get("train_files", [])),
+            "if_dataset_hf": str(data_cfg.get("if_dataset_hf", "")),
+            "if_dataset_seed": int(data_cfg.get("if_dataset_seed", 1)),
+            "if_dataset_val_size": int(data_cfg.get("if_dataset_val_size", 512)),
+            "max_prompt_length": int(data_cfg.get("max_prompt_length", 0)),
+            "max_response_length": int(data_cfg.get("max_response_length", 0)),
+            "apply_chat_template_kwargs": OmegaConf.to_container(
+                data_cfg.get("apply_chat_template_kwargs", {}), resolve=True
+            ),
+            "rollout_temperature": float(self.config.actor_rollout_ref.rollout.get("temperature", 1.0)),
+            "rollout_top_p": float(self.config.actor_rollout_ref.rollout.get("top_p", 1.0)),
+            "rollout_top_k": int(self.config.actor_rollout_ref.rollout.get("top_k", -1)),
+            "response_length": int(self.config.actor_rollout_ref.rollout.response_length),
+        }
+
+    def _if_ref_anchor_cache_path(self) -> str | None:
+        path = self.config.get("if_ref_anchor_cache_path", None)
+        if path is None:
+            return None
+        path = str(path).strip()
+        return path or None
+
+    def _load_if_ref_anchor_cache(self) -> bool:
+        path = self._if_ref_anchor_cache_path()
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[IF ref anchor] failed to load cache {path}: {exc}; regenerating")
+            return False
+
+        expected_metadata = self._if_ref_anchor_cache_metadata()
+        actual_metadata = payload.get("metadata", {})
+        if actual_metadata != expected_metadata:
+            metadata_strict = normalize_bool_config(self.config.get("if_ref_anchor_cache_metadata_strict", True), True)
+            if not metadata_strict:
+                print(
+                    f"[IF ref anchor] cache metadata mismatch for {path}; "
+                    "reusing because if_ref_anchor_cache_metadata_strict=false"
+                )
+            else:
+                print(f"[IF ref anchor] cache metadata mismatch for {path}; regenerating")
+                print(f"[IF ref anchor] expected metadata: {expected_metadata}")
+                print(f"[IF ref anchor] actual metadata: {actual_metadata}")
+                return False
+
+        cache = {}
+        for key, item in payload.get("items", {}).items():
+            try:
+                index = int(key)
+            except (TypeError, ValueError):
+                continue
+            cache[index] = {
+                "y0": list(item.get("y0") or []),
+                "y1": list(item.get("y1") or []),
+                "ref0_nll": float(item.get("ref0_nll", float("inf"))),
+                "ref0_token_count": int(item.get("ref0_token_count", 0)),
+                "ref0_ppl": float(item.get("ref0_ppl", float("inf"))),
+                "ref1_nll": float(item.get("ref1_nll", float("inf"))),
+                "ref1_token_count": int(item.get("ref1_token_count", 0)),
+                "ref1_ppl": float(item.get("ref1_ppl", float("inf"))),
+            }
+        self.if_ref_anchor_cache = cache
+        print(f"[IF ref anchor] loaded {len(cache)} cached train samples from {path}")
+        return bool(cache)
+
+    def _save_if_ref_anchor_cache(self) -> None:
+        path = self._if_ref_anchor_cache_path()
+        if not path:
+            return
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        payload = {
+            "metadata": self._if_ref_anchor_cache_metadata(),
+            "items": {str(index): item for index, item in sorted(self.if_ref_anchor_cache.items())},
+        }
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp_if_ref_anchor_", suffix=".json", dir=os.path.dirname(path) or ".")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp_path, path)
+            print(f"[IF ref anchor] saved cache to {path}")
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def _tokenize_anchor_ppl_prompt(self, row: dict) -> list[int]:
+        apply_kwargs = dict(**self.config.data.get("apply_chat_template_kwargs", {}))
+        apply_kwargs.pop("tokenize", None)
+        apply_kwargs.pop("return_dict", None)
+        apply_kwargs.pop("return_tensors", None)
+        tokenized = self.tokenizer.apply_chat_template(
+            row.get("ppl_prompt") or [],
+            add_generation_prompt=True,
+            tokenize=True,
+            **apply_kwargs,
+        )
+        if isinstance(tokenized, dict):
+            tokenized = tokenized.get("input_ids", [])
+        if hasattr(tokenized, "tolist"):
+            tokenized = tokenized.tolist()
+        if tokenized and isinstance(tokenized[0], list):
+            tokenized = tokenized[0]
+        return list(tokenized)
+
+    def _if_ref_anchor_cache_item_complete(self, item: dict | None) -> bool:
+        if not item:
+            return False
+        return (
+            bool(item.get("y0"))
+            and bool(item.get("y1"))
+            and int(item.get("ref0_token_count", 0) or 0) > 0
+            and int(item.get("ref1_token_count", 0) or 0) > 0
+            and math.isfinite(float(item.get("ref0_nll", float("inf"))))
+            and math.isfinite(float(item.get("ref1_nll", float("inf"))))
+        )
+
+    def _precompute_if_ref_anchor_cache(self) -> None:
+        if not normalize_bool_config(self.config.get("if_ref_anchor_precompute", False)):
+            self.if_ref_anchor_cache = {}
+            return
+
+        total = len(self.train_dataset)
+        if getattr(self, "if_ref_anchor_cache", None) is None:
+            self.if_ref_anchor_cache = {}
+        if not self.if_ref_anchor_cache:
+            self._load_if_ref_anchor_cache()
+
+        self.if_ref_anchor_cache = {
+            int(index): item
+            for index, item in self.if_ref_anchor_cache.items()
+            if self._if_ref_anchor_cache_item_complete(item)
+        }
+        initial_cached_count = len(self.if_ref_anchor_cache)
+        if initial_cached_count >= total:
+            print(f"[IF ref anchor] using complete cached train samples: {initial_cached_count}/{total}")
+            return
+
+        if normalize_bool_config(self.config.get("if_ref_anchor_skip_missing_precompute", False)):
+            print(
+                f"[IF ref anchor] using cached train samples only: {initial_cached_count}/{total}; "
+                f"skipping {max(total - initial_cached_count, 0)} missing anchor precompute samples"
+            )
+            return
+
+        batch_size = int(self.config.get("if_ref_anchor_precompute_batch_size", self.config.data.get("gen_batch_size", self.config.data.train_batch_size)))
+        save_interval = int(self.config.get("if_ref_anchor_cache_save_interval", 50000))
+        agent_workers = int(self.config.actor_rollout_ref.rollout.agent.get("num_workers", 1))
+        next_save_count = ((initial_cached_count // save_interval) + 1) * save_interval if save_interval > 0 else total + 1
+        last_saved_count = initial_cached_count
+        print(
+            f"[IF ref anchor] precomputing y0/y1 and anchor PPL for {total} train samples "
+            f"with initial rollout/ref policy; resuming from {initial_cached_count} cached samples"
+        )
+
+        try:
+            with tqdm(total=total * 4, initial=initial_cached_count * 4, desc="IF ref anchor precompute", unit="sample") as pbar:
+                for start in range(0, total, batch_size):
+                    end = min(start + batch_size, total)
+                    rows = [self.train_dataset[idx] for idx in range(start, end)]
+                    rows = [
+                        row
+                        for row in rows
+                        if not self._if_ref_anchor_cache_item_complete(
+                            self.if_ref_anchor_cache.get(int(row.get("index", 0)))
+                        )
+                    ]
+                    if not rows:
+                        continue
+
+                    generation_rows = rows
+                    if rows and agent_workers > 1:
+                        pad_count = (-len(rows)) % agent_workers
+                        if pad_count:
+                            generation_rows = rows + [rows[-1]] * pad_count
+                    y0_batch = self._make_anchor_generation_batch(generation_rows, "ppl_prompt")
+                    y1_batch = self._make_anchor_generation_batch(generation_rows, "prompt")
+                    y0_batch.meta_info["global_steps"] = self.global_steps
+                    y1_batch.meta_info["global_steps"] = self.global_steps
+                    batch_label = f"{start}-{end}" if len(rows) == end - start else f"{start}-{end} missing={len(rows)}"
+                    pbar.set_postfix_str(f"y0 {batch_label}")
+                    y0_output = self.async_rollout_manager.generate_sequences(y0_batch)
+                    pbar.update(len(rows))
+                    pbar.set_postfix_str(f"y1 {batch_label}")
+                    y1_output = self.async_rollout_manager.generate_sequences(y1_batch)
+                    pbar.update(len(rows))
+                    y0_ids = self._extract_anchor_answer_ids(y0_output)[: len(rows)]
+                    y1_ids = self._extract_anchor_answer_ids(y1_output)[: len(rows)]
+                    pbar.set_postfix_str(f"score y0 {batch_label}")
+                    y0_nlls, y0_token_counts, y0_ppls = self._extract_anchor_vllm_scores(y0_output, len(rows))
+                    pbar.update(len(rows))
+                    pbar.set_postfix_str(f"score y1 {batch_label}")
+                    y1_nlls, y1_token_counts, y1_ppls = self._extract_anchor_vllm_scores(y1_output, len(rows))
+                    pbar.update(len(rows))
+                    for local_idx, (row, ref0_ids, ref1_ids) in enumerate(zip(rows, y0_ids, y1_ids, strict=True)):
+                        self.if_ref_anchor_cache[int(row.get("index", 0))] = {
+                            "y0": list(ref0_ids),
+                            "y1": list(ref1_ids),
+                            "ref0_nll": float(y0_nlls[local_idx]),
+                            "ref0_token_count": int(y0_token_counts[local_idx]),
+                            "ref0_ppl": float(y0_ppls[local_idx]),
+                            "ref1_nll": float(y1_nlls[local_idx]),
+                            "ref1_token_count": int(y1_token_counts[local_idx]),
+                            "ref1_ppl": float(y1_ppls[local_idx]),
+                        }
+
+                    completed_count = len(self.if_ref_anchor_cache)
+                    if save_interval > 0 and completed_count >= next_save_count and completed_count < total:
+                        self._save_if_ref_anchor_cache()
+                        last_saved_count = completed_count
+                        while next_save_count <= completed_count:
+                            next_save_count += save_interval
+                    if end < total:
+                        self.checkpoint_manager.sleep_replicas()
+                        self.checkpoint_manager.update_weights(self.global_steps)
+        finally:
+            if len(getattr(self, "if_ref_anchor_cache", {})) > last_saved_count:
+                self._save_if_ref_anchor_cache()
+        print(f"[IF ref anchor] cached {len(self.if_ref_anchor_cache)} train samples")
+
+    def _attach_if_ref_anchor_cache(self, batch: DataProto) -> dict[str, float]:
+        if not normalize_bool_config(self.config.get("if_ref_anchor_precompute", False)):
+            return {}
+        cache = getattr(self, "if_ref_anchor_cache", {})
+        if not cache or "index" not in batch.non_tensor_batch:
+            return {"if_ref_anchor_cache/missing": 1.0}
+        ref0 = []
+        ref1 = []
+        ref0_nlls = []
+        ref0_token_counts = []
+        ref0_ppls = []
+        ref1_nlls = []
+        ref1_token_counts = []
+        ref1_ppls = []
+        hit = 0
+        for value in batch.non_tensor_batch["index"]:
+            item = cache.get(int(value), {})
+            y0 = list(item.get("y0") or [])
+            y1 = list(item.get("y1") or [])
+            ref0_count = int(item.get("ref0_token_count", 0) or 0)
+            ref1_count = int(item.get("ref1_token_count", 0) or 0)
+            hit += int(bool(y0) and bool(y1) and ref0_count > 0 and ref1_count > 0)
+            ref0.append(y0)
+            ref1.append(y1)
+            ref0_nlls.append(float(item.get("ref0_nll", float("inf"))))
+            ref0_token_counts.append(ref0_count)
+            ref0_ppls.append(float(item.get("ref0_ppl", float("inf"))))
+            ref1_nlls.append(float(item.get("ref1_nll", float("inf"))))
+            ref1_token_counts.append(ref1_count)
+            ref1_ppls.append(float(item.get("ref1_ppl", float("inf"))))
+        batch.non_tensor_batch["ppl_y_ref0_ids"] = np.array(ref0, dtype=object)
+        batch.non_tensor_batch["ppl_y_ref1_ids"] = np.array(ref1, dtype=object)
+        batch.non_tensor_batch["p_y_ref_given_x_nll"] = np.array(ref0_nlls, dtype=object)
+        batch.non_tensor_batch["p_y_ref_given_x_token_count"] = np.array(ref0_token_counts, dtype=object)
+        batch.non_tensor_batch["p_y_ref_given_x_ppl"] = np.array(ref0_ppls, dtype=object)
+        batch.non_tensor_batch["p_y_ref_xc_given_x_nll"] = np.array(ref1_nlls, dtype=object)
+        batch.non_tensor_batch["p_y_ref_xc_given_x_token_count"] = np.array(ref1_token_counts, dtype=object)
+        batch.non_tensor_batch["p_y_ref_xc_given_x_ppl"] = np.array(ref1_ppls, dtype=object)
+        return {
+            "if_ref_anchor_cache/hit_count": float(hit),
+            "if_ref_anchor_cache/size": float(len(cache)),
+            "if_ref_anchor_cache/using_cached_ppl": 1.0,
+        }
+
     def _compute_old_log_prob(self, batch: DataProto):
         # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
         # step 1: convert dataproto to tensordict.
@@ -1588,6 +2322,15 @@ class RayPPOTrainer:
                 self._shutdown_dump_executor()
                 return
 
+        if normalize_bool_config(self.config.get("if_ref_anchor_precompute", False)):
+            self.checkpoint_manager.update_weights(self.global_steps)
+            self._precompute_if_ref_anchor_cache()
+            if normalize_bool_config(self.config.get("if_ref_anchor_precompute_only", False)):
+                self._shutdown_dump_executor()
+                return
+            # Precompute leaves rollout replicas asleep; wake them for the first training rollout.
+            self.checkpoint_manager.update_weights(self.global_steps)
+
         if self.config.actor_rollout_ref.rollout.skip.get("enable", False):
             rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
             rollout_skip.wrap_generate_sequences()
@@ -1685,6 +2428,7 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+                    metrics.update(self._attach_if_ref_anchor_cache(batch))
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1733,36 +2477,59 @@ class RayPPOTrainer:
                         # ##6/3 ppl## Snapshot the constraint-only reward BEFORE any PPL shaping so both
                         # directions gate on the original IF reward, not a PPL-polluted running total.
                         constraint_reward_scores = reward_tensor.sum(dim=-1).detach().clone()
+                        metrics.update(self._compute_anchor_ppl_with_ref_policy(batch))
                         # ##6/3 ppl## Rank rewards are applied after old IF reward exists and before advantage computation.
                         py_given_x_reward_coeff = float(
                             self.config.get("if_py_given_x_reward_coeff", self.config.get("if_ppl_reward_coeff", 1.0))
                         )
                         px_given_y_reward_coeff = float(self.config.get("if_px_given_y_reward_coeff", 0.0))
                         rollout_n = int(self.config.actor_rollout_ref.rollout.n)
-                        reward_tensor, py_given_x_metrics = apply_if_ppl_rank_reward(
-                            batch,
-                            reward_tensor,
-                            ppl_reward_coeff=py_given_x_reward_coeff,
-                            rollout_n=rollout_n,
-                            metric_prefix="if_p_y_given_x",
-                            ppl_key="p_y_given_x_ppl",
-                            nll_key="p_y_given_x_nll",
-                            token_count_key="p_y_given_x_token_count",
-                            gate_scores=constraint_reward_scores,
-                        )
+                        ppl_rank_reward_mode = self.config.get("if_ppl_rank_reward_mode", "both")
+                        ppl_anchor_reward_mode = self.config.get("if_ppl_anchor_reward_mode", "both")
+                        ref_ppl_gate_enabled = normalize_bool_config(self.config.get("if_ref_ppl_gate", False))
+                        ref_ppl_gate_margin = float(self.config.get("if_ref_ppl_gate_margin", 0.0))
+                        ppl_reward_strategy = str(self.config.get("if_ppl_reward_strategy", "rank")).strip().lower()
+                        if ppl_reward_strategy == "anchor":
+                            reward_tensor, py_given_x_metrics = apply_if_ppl_anchor_reward(
+                                batch,
+                                reward_tensor,
+                                ppl_reward_coeff=py_given_x_reward_coeff,
+                                metric_prefix="if_p_y_given_x_anchor",
+                                gate_scores=constraint_reward_scores,
+                                anchor_reward_mode=ppl_anchor_reward_mode,
+                            )
+                        else:
+                            reward_tensor, py_given_x_metrics = apply_if_ppl_rank_reward(
+                                batch,
+                                reward_tensor,
+                                ppl_reward_coeff=py_given_x_reward_coeff,
+                                rollout_n=rollout_n,
+                                metric_prefix="if_p_y_given_x",
+                                ppl_key="p_y_given_x_ppl",
+                                nll_key="p_y_given_x_nll",
+                                token_count_key="p_y_given_x_token_count",
+                                gate_scores=constraint_reward_scores,
+                                rank_reward_mode=ppl_rank_reward_mode,
+                                ref_nll_key="p_y_ref_given_x_nll",
+                                ref_token_count_key="p_y_ref_given_x_token_count",
+                                ref_ppl_gate_enabled=ref_ppl_gate_enabled,
+                                ref_ppl_gate_margin=ref_ppl_gate_margin,
+                            )
                         metrics.update(py_given_x_metrics)
-                        reward_tensor, px_given_y_metrics = apply_if_ppl_rank_reward(
-                            batch,
-                            reward_tensor,
-                            ppl_reward_coeff=px_given_y_reward_coeff,
-                            rollout_n=rollout_n,
-                            metric_prefix="if_p_x_given_y",
-                            ppl_key="p_x_given_y_ppl",
-                            nll_key="p_x_given_y_nll",
-                            token_count_key="p_x_given_y_token_count",
-                            gate_scores=constraint_reward_scores,
-                        )
-                        metrics.update(px_given_y_metrics)
+                        if px_given_y_reward_coeff != 0.0:
+                            reward_tensor, px_given_y_metrics = apply_if_ppl_rank_reward(
+                                batch,
+                                reward_tensor,
+                                ppl_reward_coeff=px_given_y_reward_coeff,
+                                rollout_n=rollout_n,
+                                metric_prefix="if_p_x_given_y",
+                                ppl_key="p_x_given_y_ppl",
+                                nll_key="p_x_given_y_nll",
+                                token_count_key="p_x_given_y_token_count",
+                                gate_scores=constraint_reward_scores,
+                                rank_reward_mode=ppl_rank_reward_mode,
+                            )
+                            metrics.update(px_given_y_metrics)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)

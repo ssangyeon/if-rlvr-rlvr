@@ -32,6 +32,25 @@ from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import deprecated
 
 
+def _to_plain_container(value):
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
+
+
+def _stringify_runtime_env_vars(runtime_env):
+    runtime_env = _to_plain_container(runtime_env)
+    if runtime_env is None:
+        return None
+
+    runtime_env = dict(runtime_env)
+    env_vars = runtime_env.get("env_vars")
+    if env_vars is not None:
+        env_vars = _to_plain_container(env_vars)
+        runtime_env["env_vars"] = {str(key): str(value) for key, value in dict(env_vars).items()}
+    return runtime_env
+
+
 
 @deprecated(
     "main_ppo.py is deprecated, and wil be replaced by main_ppo_sync.py in v0.8.0, please use main_ppo_sync.py instead."
@@ -76,9 +95,11 @@ def run_ppo(config, task_runner_class=None) -> None:
             runtime_env_kwargs["env_vars"] = runtime_env_vars
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
-        ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        ray_init_kwargs = _to_plain_container(ray_init_kwargs)
+        ray_init_kwargs = dict(ray_init_kwargs)
+        ray_init_kwargs["runtime_env"] = _stringify_runtime_env_vars(runtime_env)
         print(f"ray init kwargs: {ray_init_kwargs}")
-        ray.init(**OmegaConf.to_container(ray_init_kwargs))
+        ray.init(**ray_init_kwargs)
 
     if task_runner_class is None:
         task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head

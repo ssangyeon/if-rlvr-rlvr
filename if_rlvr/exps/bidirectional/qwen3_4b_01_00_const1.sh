@@ -54,7 +54,7 @@ PY
 ########################### end NLTK data ###########################
 
 ########################### runtime selection (non-invasive) ###########################
-VERL_DIR=${VERL_DIR:-/NHNHOME/WORKSPACE/26msit001_T_A/IFIF/if-rlvr}
+VERL_DIR=${VERL_DIR:-/NHNHOME/26msit001_A/IFIF/if-rlvr/}
 export PYTHONPATH="${VERL_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 IF_RLVR_DIR=${IF_RLVR_DIR:-${VERL_DIR}/if_rlvr}
 REWARD_FN_PATH="${IF_RLVR_DIR}/if_reward_fn.py"
@@ -105,6 +105,11 @@ EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_if_grpo_${INFER_BACKEND}_fsdp_think_
 WANDB_ENTITY=${WANDB_ENTITY:-ifif}
 export WANDB_ENTITY
 ########################### end user-adjustable ###########################
+
+########################### concurrent local run isolation ###########################
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "${SCRIPT_DIR}/_concurrent_run_env.sh"
+########################### end concurrent local run isolation ###########################
 
 ########################### derived defaults ###########################
 case "${DEVICE}" in
@@ -253,4 +258,5 @@ python3 -m verl.trainer.main_ppo \
     "${REWARD[@]}" \
     "${TRAINER[@]}" \
     "${EXTRA[@]}" \
+    "${IF_RLVR_RAY_INIT_OVERRIDES[@]}" \
     "$@"

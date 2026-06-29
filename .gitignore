@@ -131,4 +131,6 @@ ENV/
 logs
 log
 outputs
+restart_logs/
+merge_logs/
 .history

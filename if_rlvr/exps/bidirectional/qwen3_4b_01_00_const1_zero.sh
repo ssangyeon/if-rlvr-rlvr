@@ -54,7 +54,7 @@ PY
 ########################### end NLTK data ###########################
 
 ########################### runtime selection (non-invasive) ###########################
-VERL_DIR=${VERL_DIR:-/NHNHOME/WORKSPACE/26msit001_T_A/IFIF/if-rlvr}
+VERL_DIR=${VERL_DIR:-/NHNHOME/26msit001_A/IFIF/if-rlvr/}
 export PYTHONPATH="${VERL_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 IF_RLVR_DIR=${IF_RLVR_DIR:-${VERL_DIR}/if_rlvr}
 REWARD_FN_PATH="${IF_RLVR_DIR}/if_reward_fn.py"
@@ -87,9 +87,9 @@ log_prob_max_token_len_per_gpu=${LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-${ppo_max_token
 actor_lr=${ACTOR_LR:-5e-7}
 kl_loss_coef=${KL_LOSS_COEF:-0.001}
 entropy_coeff=${ENTROPY_COEFF:-0}
-py_given_x_reward_coeff=${PY_GIVEN_X_REWARD_COEFF:-${PPL_REWARD_COEFF:-0.0}}  # ##6/3 ppl## p(y|x)
-px_given_y_reward_coeff=${PX_GIVEN_Y_REWARD_COEFF:-0.1}  # ##6/3 ppl## p(x|y)
-clipped_rollout_mode=${CLIPPED_ROLLOUT_MODE:-use}  # ##6/3 ppl## use|zero|drop
+py_given_x_reward_coeff=${PY_GIVEN_X_REWARD_COEFF:-${PPL_REWARD_COEFF:-0.1}}  # ##6/3 ppl## p(y|x)
+px_given_y_reward_coeff=${PX_GIVEN_Y_REWARD_COEFF:-0.0}  # ##6/3 ppl## p(x|y)
+clipped_rollout_mode=${CLIPPED_ROLLOUT_MODE:-zero}  # ##6/3 ppl## use|zero|drop
 
 rollout_tp=${ROLLOUT_TP:-1}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.85}
@@ -101,7 +101,7 @@ save_freq=${SAVE_FREQ:-25}
 test_freq=${TEST_FREQ:-1000}
 
 PROJECT_NAME=${PROJECT_NAME:-verl_if_rlvr}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_if_grpo_${INFER_BACKEND}_fsdp_think_${ENABLE_THINKING}_pyx_${py_given_x_reward_coeff}_pxy_${px_given_y_reward_coeff}_clip_${clipped_rollout_mode}_bsz_${train_batch_size}_const1only}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_if_grpo_${INFER_BACKEND}_fsdp_think_${ENABLE_THINKING}_pyx_${py_given_x_reward_coeff}_pxy_${px_given_y_reward_coeff}_clip_${clipped_rollout_mode}_bsz_${train_batch_size}_const1only_zero}
 WANDB_ENTITY=${WANDB_ENTITY:-ifif}
 export WANDB_ENTITY
 ########################### end user-adjustable ###########################

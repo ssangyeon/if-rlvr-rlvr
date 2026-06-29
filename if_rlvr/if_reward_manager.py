@@ -95,6 +95,12 @@ class IFRewardManager(RewardManagerBase):
             return default
 
         self.verification_reward = float(_get("verification_reward", _DEFAULT_VERIFICATION_REWARD))
+        self.require_think_end = os.getenv("IF_REQUIRE_THINK_END_FOR_REWARD", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self.apply_non_stop_penalty = bool(_get("apply_non_stop_penalty", _DEFAULT_APPLY_NON_STOP_PENALTY))
         self.non_stop_penalty_value = float(_get("non_stop_penalty_value", _DEFAULT_NON_STOP_PENALTY_VALUE))
         try:
@@ -150,7 +156,9 @@ class IFRewardManager(RewardManagerBase):
         response_str = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
         )
-        verifier_score = await self.loop.run_in_executor(None, lambda: score_ifeval(response_str, ground_truth))
+        verifier_score = await self.loop.run_in_executor(
+            None, lambda: score_ifeval(response_str, ground_truth, require_think_end=self.require_think_end)
+        )
 
         is_non_stop = self._is_non_stop(valid_response_ids, valid_response_length, response_length)
         if self.apply_non_stop_penalty and is_non_stop:

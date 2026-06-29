@@ -37,7 +37,24 @@ from . import instructions_registry
 logger = logging.getLogger(__name__)
 
 
-def remove_thinking_section(prediction: str) -> str:
+def _strip_gemma_thought_channel(prediction: str) -> str:
+    # Gemma thinking uses: <|channel>thought\n...<channel|>[final answer].
+    # When disabled, some variants may emit an empty thought block before the answer.
+    for start_marker in ("<|channel>thought\n", "<|channel>thought"):
+        start = prediction.find(start_marker)
+        if start < 0:
+            continue
+        end = prediction.find("<channel|>", start + len(start_marker))
+        if end >= 0:
+            return prediction[end + len("<channel|>") :]
+    return prediction
+
+
+def _has_gemma_thought_channel(prediction: str) -> bool:
+    return _strip_gemma_thought_channel(prediction) != prediction
+
+
+def remove_thinking_section(prediction: str, require_think_end: bool = False) -> str | None:
     """Strip a reasoning/thinking section and answer tags before verification.
 
     Verbatim from open_instruct.ground_truth_utils.remove_thinking_section. For
@@ -47,14 +64,20 @@ def remove_thinking_section(prediction: str) -> str:
     response contains no ``</think>`` and is returned unchanged.
     """
     prediction = prediction.replace("<|assistant|>", "").strip()
+    has_qwen_think_end = "</think>" in prediction
+    has_gemma_thought = _has_gemma_thought_channel(prediction)
+    if require_think_end and not (has_qwen_think_end or has_gemma_thought):
+        return None
     # remove thinking section from the prediction
     prediction = prediction.split("</think>")[-1]
+    prediction = _strip_gemma_thought_channel(prediction)
     # remove answer tags from the prediction
     prediction = prediction.replace("<answer>", "").replace("</answer>", "")
+    prediction = prediction.replace("<|think|>", "")
     return prediction.strip()
 
 
-def score_ifeval(prediction: str, label) -> float:
+def score_ifeval(prediction: str, label, require_think_end: bool = False) -> float:
     """Score one instruction-following response against its constraint set.
 
     Faithful reproduction of ``IFEvalVerifier.__call__`` (open-instruct). Returns a
@@ -78,10 +101,13 @@ def score_ifeval(prediction: str, label) -> float:
     constraint_dict = constraint_dict[0]
     if isinstance(constraint_dict, str):
         constraint_dict = json.loads(constraint_dict)
-    answer = remove_thinking_section(prediction)
+    answer = remove_thinking_section(prediction, require_think_end=require_think_end)
     instruction_keys = constraint_dict["instruction_id"]
     args_list = constraint_dict["kwargs"]
     rewards = []
+    if answer is None:
+        logger.warning("Missing </think> in reasoning response received for IFEvalVerifier.")
+        return 0.0
     if len(prediction) == 0 or len(answer) == 0:
         logger.warning("Empty prediction received for IFEvalVerifier.")
         return 0.0

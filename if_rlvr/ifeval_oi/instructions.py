@@ -891,7 +891,7 @@ class JsonFormat(Instruction):
         )
         try:
             json.loads(value)
-        except ValueError:
+        except (json.JSONDecodeError, RecursionError, ValueError):
             return False
         return True
 

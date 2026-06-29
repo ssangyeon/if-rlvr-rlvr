@@ -722,7 +722,8 @@ class AgentLoopWorker:
                 output.multi_modal_data.get("audios") if output.multi_modal_data else None
             ),
         )
-        await self._compute_score([output], kwargs=kwargs)
+        if not kwargs.get("__skip_compute_score__", False):
+            await self._compute_score([output], kwargs=kwargs)
         await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,

@@ -106,6 +106,11 @@ WANDB_ENTITY=${WANDB_ENTITY:-ifif}
 export WANDB_ENTITY
 ########################### end user-adjustable ###########################
 
+########################### concurrent local run isolation ###########################
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "${SCRIPT_DIR}/_concurrent_run_env.sh"
+########################### end concurrent local run isolation ###########################
+
 ########################### derived defaults ###########################
 case "${DEVICE}" in
     gpu | npu) ;;
@@ -253,4 +258,5 @@ python3 -m verl.trainer.main_ppo \
     "${REWARD[@]}" \
     "${TRAINER[@]}" \
     "${EXTRA[@]}" \
+    "${IF_RLVR_RAY_INIT_OVERRIDES[@]}" \
     "$@"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GRPO | Qwen3-4B | IF-RLVR | B200 speed-only profile
+# GRPO | Qwen3-4B | IF-RLVR | B200 speed-only profile | reasoning
 #
 # This is intentionally the same training setup as run_qwen3_4b_if_rlvr.sh.
 # The only default changes are throughput knobs:
@@ -54,7 +54,7 @@ PY
 ########################### end NLTK data ###########################
 
 ########################### runtime selection (non-invasive) ###########################
-VERL_DIR=${VERL_DIR:-/NHNHOME/WORKSPACE/26msit001_T_A/IFIF/if-rlvr}
+VERL_DIR=${VERL_DIR:-/NHNHOME/26msit001_A/IFIF/if-rlvr/}
 export PYTHONPATH="${VERL_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 IF_RLVR_DIR=${IF_RLVR_DIR:-${VERL_DIR}/if_rlvr}
 REWARD_FN_PATH="${IF_RLVR_DIR}/if_reward_fn.py"
@@ -65,7 +65,9 @@ DEVICE=${DEVICE:-$(python3 -c 'import torch_npu' 2>/dev/null && echo npu || echo
 INFER_BACKEND=${INFER_BACKEND:-vllm}
 MACHINE=${MACHINE:-}
 
-ENABLE_THINKING=${ENABLE_THINKING:-false}
+ENABLE_THINKING=${ENABLE_THINKING:-true}
+export IF_APPLY_ENABLE_THINKING_KWARG=${IF_APPLY_ENABLE_THINKING_KWARG:-true}
+export IF_REQUIRE_THINK_END_FOR_REWARD=${IF_REQUIRE_THINK_END_FOR_REWARD:-${ENABLE_THINKING}}
 IF_VAL_SIZE=${IF_VAL_SIZE:-512}
 IF_DATA_SEED=${IF_DATA_SEED:-1}
 DATA_PROCESSOR_CPU_COUNT=${DATA_PROCESSOR_CPU_COUNT:-64}
@@ -79,29 +81,47 @@ NPUS_PER_NODE=${NPUS_PER_NODE:-}
 # original: train_batch_size=256, ppo_mini_batch_size=256, token cap=65536.
 train_batch_size=${TRAIN_BATCH_SIZE:-512}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-${train_batch_size}}
-max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
-max_response_length=${MAX_RESPONSE_LENGTH:-2048}
+max_prompt_length=${MAX_PROMPT_LENGTH:-16384}
+max_response_length=${MAX_RESPONSE_LENGTH:-16384}
 ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-98304}
 log_prob_max_token_len_per_gpu=${LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-${ppo_max_token_len_per_gpu}}
 
-actor_lr=${ACTOR_LR:-5e-7}
+actor_lr=${ACTOR_LR:-1e-6}
 kl_loss_coef=${KL_LOSS_COEF:-0.001}
 entropy_coeff=${ENTROPY_COEFF:-0}
-py_given_x_reward_coeff=${PY_GIVEN_X_REWARD_COEFF:-${PPL_REWARD_COEFF:-0.0}}  # ##6/3 ppl## p(y|x)
-px_given_y_reward_coeff=${PX_GIVEN_Y_REWARD_COEFF:-0.1}  # ##6/3 ppl## p(x|y)
+py_given_x_reward_coeff=${PY_GIVEN_X_REWARD_COEFF:-${PPL_REWARD_COEFF:-0.1}}  # ##6/3 ppl## p(y|x)
+if_ppl_reward_strategy=${IF_PPL_REWARD_STRATEGY:-anchor}  # ##6/3 ppl## rank|anchor
+if_ppl_anchor_reward_mode=${IF_PPL_ANCHOR_REWARD_MODE:-both}  # ##6/3 ppl## both|no_lower_zero|lower_zero_only
+if_ref_ppl_gate=${IF_REF_PPL_GATE:-false}  # unused in anchor mode; lower gate is handled by anchor reward
+if_ref_ppl_gate_margin=${IF_REF_PPL_GATE_MARGIN:-0.0}
+if_ref_anchor_precompute=${IF_REF_ANCHOR_PRECOMPUTE:-true}
+if_ref_policy_anchor_ppl=${IF_REF_POLICY_ANCHOR_PPL:-true}
+if_ref_anchor_precompute_batch_size=${IF_REF_ANCHOR_PRECOMPUTE_BATCH_SIZE:-4096}
+agent_num_workers=${AGENT_NUM_WORKERS:-512}
+if_ref_anchor_cache_path=${IF_REF_ANCHOR_CACHE_PATH:-${CACHE_ROOT}/if_ref_anchor_qwen3_4b_const1_train_seed${IF_DATA_SEED}_val${IF_VAL_SIZE}_thinkfalse.json}
+if_ref_anchor_cache_metadata_strict=${IF_REF_ANCHOR_CACHE_METADATA_STRICT:-false}
+if_ref_anchor_skip_missing_precompute=${IF_REF_ANCHOR_SKIP_MISSING_PRECOMPUTE:-false}
+if_ref_anchor_train_cached_only=${IF_REF_ANCHOR_TRAIN_CACHED_ONLY:-${if_ref_anchor_skip_missing_precompute}}
+export IF_REF_ANCHOR_CACHE_PATH="${if_ref_anchor_cache_path}"
+export IF_REF_ANCHOR_TRAIN_CACHED_ONLY="${if_ref_anchor_train_cached_only}"
+export IF_REF_PPL_BASELINE=${IF_REF_PPL_BASELINE:-0}
+export IF_REF_PPL_ANCHOR=${IF_REF_PPL_ANCHOR:-0}
+export IF_REF_VLLM_BASE_URL=${IF_REF_VLLM_BASE_URL:-}
+export IF_REF_VLLM_MODEL=${IF_REF_VLLM_MODEL:-Qwen/Qwen3-4B}
+px_given_y_reward_coeff=${PX_GIVEN_Y_REWARD_COEFF:-0.0}  # ##6/3 ppl## p(x|y)
 clipped_rollout_mode=${CLIPPED_ROLLOUT_MODE:-use}  # ##6/3 ppl## use|zero|drop
 
 rollout_tp=${ROLLOUT_TP:-1}
-rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.85}
+rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.9}
 rollout_n=${ROLLOUT_N:-8}
 sp_size=${SP_SIZE:-1}
 
-total_epochs=${TOTAL_EPOCHS:-1}
+total_epochs=${TOTAL_EPOCHS:-3}
 save_freq=${SAVE_FREQ:-25}
 test_freq=${TEST_FREQ:-1000}
 
 PROJECT_NAME=${PROJECT_NAME:-verl_if_rlvr}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_if_grpo_${INFER_BACKEND}_fsdp_think_${ENABLE_THINKING}_pyx_${py_given_x_reward_coeff}_pxy_${px_given_y_reward_coeff}_clip_${clipped_rollout_mode}_bsz_${train_batch_size}_const1only}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_if_grpo_${INFER_BACKEND}_fsdp_think_${ENABLE_THINKING}_pyx_anchor_${py_given_x_reward_coeff}_pxy_${px_given_y_reward_coeff}_clip_${clipped_rollout_mode}_bsz_${train_batch_size}_const1only_refanchor_precompute_refpolicy_qwen3_4b}
 WANDB_ENTITY=${WANDB_ENTITY:-ifif}
 export WANDB_ENTITY
 ########################### end user-adjustable ###########################
@@ -155,8 +175,8 @@ case "${DEVICE}" in
         rollout_tp=${rollout_tp:-4}
         sp_size=4
         train_batch_size=16
-        max_prompt_length=$((1024 * 2))
-        max_response_length=$((1024 * 32))
+        max_prompt_length=${MAX_PROMPT_LENGTH:-32768}
+        max_response_length=${MAX_RESPONSE_LENGTH:-32768}
         ppo_mini_batch_size=16
         rollout_gpu_mem_util=0.3
         EXTRA+=(
@@ -191,8 +211,19 @@ DATA=(
     data.truncation='error'
     data.prompt_key=prompt
     data.reward_fn_key=data_source
-    "+data.apply_chat_template_kwargs.enable_thinking=${ENABLE_THINKING}"
 )
+
+case "${IF_APPLY_ENABLE_THINKING_KWARG}" in
+    1 | true | TRUE | yes | YES | on | ON)
+        DATA+=("+data.apply_chat_template_kwargs.enable_thinking=${ENABLE_THINKING}")
+        ;;
+    0 | false | FALSE | no | NO | off | OFF)
+        ;;
+    *)
+        echo "IF_APPLY_ENABLE_THINKING_KWARG must be true/false, got: ${IF_APPLY_ENABLE_THINKING_KWARG}" >&2
+        exit 1
+        ;;
+esac
 
 MODEL=(
     actor_rollout_ref.model.path="$MODEL_PATH"
@@ -220,6 +251,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.n=${rollout_n}
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${log_prob_max_token_len_per_gpu}
+    actor_rollout_ref.rollout.agent.num_workers=${agent_num_workers}
 )
 
 REF=(
@@ -233,6 +265,16 @@ REWARD=(
     custom_reward_function.name=compute_score
     "+if_py_given_x_reward_coeff=${py_given_x_reward_coeff}"  # ##6/3 ppl## p(y|x)
     "+if_px_given_y_reward_coeff=${px_given_y_reward_coeff}"  # ##6/3 ppl## p(x|y)
+    "+if_ppl_reward_strategy=${if_ppl_reward_strategy}"
+    "+if_ppl_anchor_reward_mode=${if_ppl_anchor_reward_mode}"
+    "+if_ref_anchor_precompute=${if_ref_anchor_precompute}"
+    "+if_ref_policy_anchor_ppl=${if_ref_policy_anchor_ppl}"
+    "+if_ref_anchor_precompute_batch_size=${if_ref_anchor_precompute_batch_size}"
+    "+if_ref_anchor_cache_path=${if_ref_anchor_cache_path}"
+    "+if_ref_anchor_cache_metadata_strict=${if_ref_anchor_cache_metadata_strict}"
+    "+if_ref_anchor_skip_missing_precompute=${if_ref_anchor_skip_missing_precompute}"
+    "+if_ref_ppl_gate=${if_ref_ppl_gate}"
+    "+if_ref_ppl_gate_margin=${if_ref_ppl_gate_margin}"
     "+clipped_rollout_mode=${clipped_rollout_mode}"  # ##6/3 ppl##
 )
 
@@ -246,6 +288,8 @@ TRAINER=(
     trainer.save_freq=${save_freq}
     trainer.test_freq=${test_freq}
     trainer.total_epochs=${total_epochs}
+    trainer.val_before_train=False
+    trainer.resume_mode=${RESUME_MODE:-auto}
 )
 
 ########################### launch ###########################

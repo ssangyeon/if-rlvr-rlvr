@@ -34,6 +34,9 @@ It is still additive: it modifies no existing verl file.
 
 from __future__ import annotations
 
+import json
+import math
+import os
 import re
 
 import datasets
@@ -114,6 +117,45 @@ def _to_verl_row(example: dict, idx: int) -> dict:
     }
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _complete_anchor_cache_indices(path: str) -> set[int] | None:
+    path = (path or "").strip()
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Failed to load IF ref anchor cache for dataset filtering: {path}: {exc}") from exc
+
+    indices: set[int] = set()
+    for key, item in payload.get("items", {}).items():
+        try:
+            index = int(key)
+            ref0_count = int(item.get("ref0_token_count", 0) or 0)
+            ref1_count = int(item.get("ref1_token_count", 0) or 0)
+            ref0_nll = float(item.get("ref0_nll", float("inf")))
+            ref1_nll = float(item.get("ref1_nll", float("inf")))
+        except (TypeError, ValueError):
+            continue
+        if (
+            item.get("y0")
+            and item.get("y1")
+            and ref0_count > 0
+            and ref1_count > 0
+            and math.isfinite(ref0_nll)
+            and math.isfinite(ref1_nll)
+        ):
+            indices.add(index)
+    return indices
+
+
 class IFMultiConstraintsDataset(RLHFDataset):
     """RLHFDataset that sources its rows from the HF Hub instead of local parquet files."""
 
@@ -140,6 +182,20 @@ class IFMultiConstraintsDataset(RLHFDataset):
             ds = ds.select(range(val_size, len(ds)))
 
         rows = [_to_verl_row(ds[i], i) for i in range(len(ds))]
+        if not want_val and _env_bool("IF_REF_ANCHOR_TRAIN_CACHED_ONLY", False):
+            cache_path = os.getenv("IF_REF_ANCHOR_CACHE_PATH", "").strip()
+            cached_indices = _complete_anchor_cache_indices(cache_path)
+            if cached_indices is None:
+                raise RuntimeError("IF_REF_ANCHOR_TRAIN_CACHED_ONLY=true requires IF_REF_ANCHOR_CACHE_PATH")
+            before = len(rows)
+            rows = [row for row in rows if int(row["extra_info"]["index"]) in cached_indices]
+            if not rows:
+                raise RuntimeError(f"No train rows matched complete IF ref anchor cache entries: {cache_path}")
+            print(
+                f"[IFMultiConstraintsDataset] filtered train split to {len(rows)} cached-anchor rows "
+                f"from {before} rows using {cache_path}"
+            )
+
         self.dataframe: datasets.Dataset = datasets.Dataset.from_list(rows)
 
         total = len(self.dataframe)
