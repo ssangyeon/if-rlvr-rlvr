@@ -13,8 +13,12 @@
 # limitations under the License.
 
 import asyncio
+import json
 import logging
 import os
+import time
+import urllib.parse
+import urllib.request
 
 import aiohttp
 import numpy as np
@@ -278,6 +282,36 @@ class RewardLoopManager:
 
     def __init__(self, config: DictConfig, rm_resource_pool: RayResourcePool = None):
         self.config = config
+        reward_kwargs = dict(self.config.reward.get("reward_kwargs", None) or {})
+        manage_sleep = reward_kwargs.get("if_llm_verifier_manage_sleep", False)
+        self.manage_external_verifier_sleep = str(manage_sleep).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.external_verifier_sleep_level = int(reward_kwargs.get("if_llm_verifier_sleep_level", 1))
+        self.external_verifier_control_timeout = float(
+            reward_kwargs.get("if_llm_verifier_control_timeout", 300)
+        )
+        base_urls = reward_kwargs.get("if_llm_verifier_base_urls") or reward_kwargs.get(
+            "if_llm_verifier_base_url", ""
+        )
+        if isinstance(base_urls, (list, tuple)):
+            raw_base_urls = [str(item) for item in base_urls]
+        else:
+            raw_base_urls = str(base_urls).split(",")
+        self.external_verifier_base_urls = []
+        for base_url in raw_base_urls:
+            normalized = base_url.strip().strip("'\"").rstrip("/")
+            if normalized.endswith("/v1"):
+                normalized = normalized[:-3]
+            if normalized and normalized not in self.external_verifier_base_urls:
+                self.external_verifier_base_urls.append(normalized)
+        if self.manage_external_verifier_sleep and not self.external_verifier_base_urls:
+            raise ValueError(
+                "if_llm_verifier_manage_sleep=true requires if_llm_verifier_base_url(s)."
+            )
         if self.config.reward.reward_model.enable:
             self.reward_model_manager = RewardModelManager(config.reward.reward_model, rm_resource_pool)
             self.reward_router_address = self.reward_model_manager.get_router_address()
@@ -288,6 +322,43 @@ class RewardLoopManager:
         self.reward_loop_workers_class = ray.remote(RewardLoopWorker)
         self.reward_manager_cls = resolve_reward_manager_cls(config)
         self._init_reward_loop_workers()
+
+    def _wait_external_verifier_sleep_state(self, base_url: str, expected: bool) -> None:
+        deadline = time.monotonic() + self.external_verifier_control_timeout
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(f"{base_url}/is_sleeping", timeout=10) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                if bool(payload.get("is_sleeping")) is expected:
+                    return
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+            time.sleep(0.25)
+        state = "sleep" if expected else "wake"
+        raise TimeoutError(
+            f"Timed out waiting for external verifier to {state} at {base_url}: {last_error}"
+        )
+
+    def _set_external_verifier_sleep(self, sleeping: bool) -> None:
+        if not self.manage_external_verifier_sleep:
+            return
+        if sleeping:
+            endpoint = f"/sleep?{urllib.parse.urlencode({'level': self.external_verifier_sleep_level})}"
+            action = "sleep"
+        else:
+            endpoint = "/wake_up"
+            action = "wake"
+        for base_url in self.external_verifier_base_urls:
+            request = urllib.request.Request(f"{base_url}{endpoint}", data=b"", method="POST")
+            with urllib.request.urlopen(request, timeout=self.external_verifier_control_timeout) as response:
+                if response.status >= 400:
+                    raise RuntimeError(
+                        f"External verifier {action} failed at {base_url}: HTTP {response.status}"
+                    )
+        for base_url in self.external_verifier_base_urls:
+            self._wait_external_verifier_sleep_state(base_url, sleeping)
+        logger.warning("External verifier %s complete: %s", action, self.external_verifier_base_urls)
 
     @property
     def reward_loop_worker_handles(self) -> list[ActorHandle]:
@@ -323,14 +394,20 @@ class RewardLoopManager:
     def compute_rm_score(self, data: DataProto) -> DataProto:
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
+        self._set_external_verifier_sleep(False)
 
-        chunks = data.chunk(len(self.reward_loop_workers))
-        outputs = ray.get(
-            [
-                worker.compute_score_batch.remote(chunk)
-                for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
-            ]
-        )
+        try:
+            chunks = data.chunk(len(self.reward_loop_workers))
+            outputs = ray.get(
+                [
+                    worker.compute_score_batch.remote(chunk)
+                    for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
+                ]
+            )
+        finally:
+            self._set_external_verifier_sleep(True)
+            if self.reward_model_manager is not None:
+                self.reward_model_manager.sleep()
         outputs_flat = [item for sublist in outputs for item in sublist]
 
         # compute rm score
@@ -343,9 +420,6 @@ class RewardLoopManager:
         non_tensor_batch = {}
         for key in reward_extra_keys:
             non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
-
-        if self.reward_model_manager is not None:
-            self.reward_model_manager.sleep()
 
         return DataProto(
             batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"reward_extra_keys": reward_extra_keys}

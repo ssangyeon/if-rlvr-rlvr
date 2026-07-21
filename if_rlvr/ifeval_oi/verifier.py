@@ -115,11 +115,22 @@ def score_ifeval(prediction: str, label, require_think_end: bool = False) -> flo
         if args is None:
             args = {}
         args = {k: v for k, v in args.items() if v is not None}
-        instruction_cls = instruction_dict[instruction_key]
-        instruction_instance = instruction_cls(instruction_key)
-        instruction_instance.build_description(**args)
-        if prediction.strip() and instruction_instance.check_following(answer):
-            rewards.append(1.0)
-        else:
-            rewards.append(0.0)
+        # Never let one constraint checker's exception (raised on adversarial /
+        # degenerate rollouts) propagate: the reward loop has no per-sample
+        # isolation up to the driver, so a single raise would crash the whole
+        # training step. An unsatisfiable/erroring constraint simply scores 0.0.
+        try:
+            instruction_cls = instruction_dict[instruction_key]
+            instruction_instance = instruction_cls(instruction_key)
+            instruction_instance.build_description(**args)
+            satisfied = bool(prediction.strip() and instruction_instance.check_following(answer))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "IFEval constraint %r raised %s: %s; scoring it 0.0",
+                instruction_key,
+                type(exc).__name__,
+                exc,
+            )
+            satisfied = False
+        rewards.append(1.0 if satisfied else 0.0)
     return sum(rewards) / max(len(rewards), 1)

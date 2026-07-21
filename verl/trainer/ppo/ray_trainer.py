@@ -1060,7 +1060,9 @@ class RayPPOTrainer:
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
-            if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+            if (self.use_rm or self.compute_reward_after_rollout) and (
+                "rm_scores" not in test_output_gen_batch_padded.batch.keys()
+            ):
                 # for colocate reward models, we need to sleep rollout model
                 # to spare GPU memory for reward model
                 self.checkpoint_manager.sleep_replicas()
@@ -1335,6 +1337,9 @@ class RayPPOTrainer:
             config=self.config,
             rm_resource_pool=resource_pool,
         )
+        self.compute_reward_after_rollout = bool(
+            OmegaConf.select(self.config, "reward.compute_after_rollout", default=False)
+        )
 
         # create async rollout manager and request scheduler
         # Note: mode is always "async" since sync mode is deprecated
@@ -1364,7 +1369,10 @@ class RayPPOTrainer:
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+        enable_agent_reward_loop = (
+            not self.compute_reward_after_rollout
+            and (not self.use_rm or self.config.reward.reward_model.enable_resource_pool)
+        )
 
         self.llm_server_manager = LLMServerManager.create(
             config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
@@ -2454,7 +2462,7 @@ class RayPPOTrainer:
                     batch.meta_info["images_seqlens"] = images_seqlens_all
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
+                        if (self.use_rm or self.compute_reward_after_rollout) and "rm_scores" not in batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(batch)
                             batch = batch.union(batch_reward)
 
@@ -2469,6 +2477,79 @@ class RayPPOTrainer:
                                     "if_constraint/acc/min": float(np.min(if_constraint)),
                                 }
                             )
+                        if "llm_verifier_called" in reward_extra_infos_dict:
+                            verifier_called = np.asarray(
+                                reward_extra_infos_dict["llm_verifier_called"], dtype=np.float32
+                            )
+                            called_mask = verifier_called > 0.5
+                            called_count = int(np.sum(called_mask))
+                            verifier_metrics = {
+                                "if_llm_verifier/called_ratio": float(np.mean(verifier_called)),
+                                "if_llm_verifier/called_count": float(called_count),
+                            }
+
+                            if "llm_verifier_score" in reward_extra_infos_dict:
+                                verifier_scores = np.asarray(
+                                    reward_extra_infos_dict["llm_verifier_score"], dtype=np.float32
+                                )
+                                valid_score_mask = called_mask & np.isfinite(verifier_scores) & (verifier_scores >= 1)
+                                valid_scores = verifier_scores[valid_score_mask]
+                                verifier_metrics.update(
+                                    {
+                                        "if_llm_verifier/score_mean": (
+                                            float(np.mean(valid_scores)) if valid_scores.size else 0.0
+                                        ),
+                                        "if_llm_verifier/score_max": (
+                                            float(np.max(valid_scores)) if valid_scores.size else 0.0
+                                        ),
+                                        "if_llm_verifier/score_min": (
+                                            float(np.min(valid_scores)) if valid_scores.size else 0.0
+                                        ),
+                                    }
+                                )
+
+                            if "llm_verifier_pass" in reward_extra_infos_dict:
+                                verifier_pass = np.asarray(
+                                    reward_extra_infos_dict["llm_verifier_pass"], dtype=np.float32
+                                )
+                                verifier_metrics["if_llm_verifier/pass_rate"] = (
+                                    float(np.mean(verifier_pass[called_mask])) if called_count else 0.0
+                                )
+
+                            if "llm_verifier_bonus" in reward_extra_infos_dict:
+                                verifier_bonus = np.asarray(
+                                    reward_extra_infos_dict["llm_verifier_bonus"], dtype=np.float32
+                                )
+                                verifier_metrics["if_llm_verifier/bonus_mean"] = float(np.mean(verifier_bonus))
+
+                            if "llm_verifier_error" in reward_extra_infos_dict:
+                                verifier_errors = np.asarray(
+                                    reward_extra_infos_dict["llm_verifier_error"], dtype=object
+                                )
+                                called_errors = verifier_errors[called_mask]
+                                verifier_metrics["if_llm_verifier/error_rate"] = (
+                                    float(np.mean([bool(str(error).strip()) for error in called_errors]))
+                                    if called_count
+                                    else 0.0
+                                )
+
+                            if "constraint_reward" in reward_extra_infos_dict:
+                                constraint_rewards = np.asarray(
+                                    reward_extra_infos_dict["constraint_reward"], dtype=np.float32
+                                )
+                                verifier_metrics["if_llm_verifier/constraint_reward_mean"] = float(
+                                    np.mean(constraint_rewards)
+                                )
+
+                            if "scaled_reward" in reward_extra_infos_dict:
+                                scaled_rewards = np.asarray(
+                                    reward_extra_infos_dict["scaled_reward"], dtype=np.float32
+                                )
+                                verifier_metrics["if_llm_verifier/scaled_reward_mean"] = float(
+                                    np.mean(scaled_rewards)
+                                )
+
+                            metrics.update(verifier_metrics)
                         # ##6/3 ppl## Optional zero-reward handling for max_response_length-clipped rollouts.
                         reward_tensor, clipped_reward_metrics = apply_clipped_rollout_reward_mode(
                             batch, reward_tensor, clipped_rollout_mode

@@ -77,7 +77,10 @@ def get_device_name() -> str:
     Returns:
         str: Device type string ('cuda', 'npu', or 'cpu').
     """
-    if is_cuda_available:
+    # Ray may import this module in a CPU-only prestarted worker and later
+    # reuse that process for a GPU task. Re-check CUDA at call time so the
+    # cached module-level value does not leave the worker classified as CPU.
+    if torch.cuda.is_available():
         device = "cuda"
     elif is_npu_available:
         device = "npu"

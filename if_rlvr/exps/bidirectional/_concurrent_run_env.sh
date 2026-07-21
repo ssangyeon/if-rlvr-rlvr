@@ -14,6 +14,22 @@ if [[ -n "${IF_RLVR_CONCURRENT_ENV_SH:-}" ]]; then
 fi
 IF_RLVR_CONCURRENT_ENV_SH=1
 
+# --- Ray node-death tolerance -------------------------------------------------
+# Root cause of the intermittent crashes (early AND late steps): this Docker container
+# has a 1600 GiB cgroup memory limit, but Ray misreads it as the host's 2.2 TB and sets
+# its OOM threshold ABOVE the cgroup cap -- so it never protects. Aggregate pressure from
+# the concurrently-running jobs drives the container to its ceiling (memory.peak ==
+# memory.max, hit 7792x). At the ceiling the kernel thrashes on reclaim (no OOM-kill:
+# oom_kill=0), and the stalls starve the raylet's heartbeat -> GCS marks the node dead ->
+# raylet fate-shares with its agents (clean exit 0) -> the whole job dies. Widen the
+# health-check window from ~seconds to ~minutes so a reclaim stall is ridden out instead
+# of being fatal. Override any of these per-run if needed.
+export RAY_health_check_failure_threshold=${RAY_health_check_failure_threshold:-20}
+export RAY_health_check_timeout_ms=${RAY_health_check_timeout_ms:-60000}
+export RAY_health_check_period_ms=${RAY_health_check_period_ms:-10000}
+export RAY_health_check_initial_delay_ms=${RAY_health_check_initial_delay_ms:-30000}
+# -----------------------------------------------------------------------------
+
 _if_rlvr_count_csv_items() {
     local csv=${1:-}
     if [[ -z "${csv}" ]]; then
@@ -129,6 +145,11 @@ unset MASTER_ADDR MASTER_PORT DIST_INIT_METHOD RANK WORLD_SIZE LOCAL_RANK LOCAL_
 IF_RLVR_RAY_INIT_OVERRIDES=(
     "+ray_kwargs.ray_init._temp_dir=${RAY_TMPDIR}"
     "+ray_kwargs.ray_init.include_dashboard=False"
+    # Cap the Plasma object store. Ray defaults it to 200 GB here because it misreads the
+    # container memory (host 2.2 TB, not the 1600 GiB cgroup cap); rollout DataProto
+    # batches need only a few GB, so reserving 200 GB just adds to the pressure that
+    # stalls the raylet. Override via IF_RLVR_OBJECT_STORE_BYTES (default 64 GiB).
+    "+ray_kwargs.ray_init.object_store_memory=${IF_RLVR_OBJECT_STORE_BYTES:-68719476736}"
     "+ray_kwargs.ray_init.namespace=${IF_RLVR_RUN_ID}"
     "+ray_kwargs.ray_init.runtime_env.env_vars.VLLM_MASTER_PORT_BASE=${VLLM_MASTER_PORT_BASE}"
     "+ray_kwargs.ray_init.runtime_env.env_vars.VLLM_PORT_STRIDE=${VLLM_PORT_STRIDE}"

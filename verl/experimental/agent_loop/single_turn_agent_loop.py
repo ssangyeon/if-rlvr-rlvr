@@ -96,6 +96,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         ).strip().lower() in {"1", "true", "yes", "on"}
         self.apply_enable_thinking_kwarg = _env_bool("IF_APPLY_ENABLE_THINKING_KWARG", True)
         self.allow_missing_think_final_answer = _env_bool("IF_ALLOW_MISSING_THINK_FINAL_ANSWER", False)
+        self.anchor_precompute_final_answer_only = _env_bool("IF_ANCHOR_PRECOMPUTE_FINAL_ANSWER_ONLY", False)
         self.anchor_precompute_empty_response_retries = int(os.getenv("IF_ANCHOR_PRECOMPUTE_EMPTY_RESPONSE_RETRIES", "2"))
         self._ref_ppl_cache: dict[tuple[int, ...], dict[str, Any]] = {}
         self._ref_xc_ppl_cache: dict[tuple[int, ...], dict[str, Any]] = {}
@@ -494,7 +495,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
         final_answer_ids, final_answer_eligible = self._extract_final_answer_ids(response_ids, prompt_ids)
         if kwargs.get("__if_anchor_precompute__", False):
             retry_count = 0
-            score_answer_ids = list(final_answer_ids) if final_answer_eligible else self._strip_leading_whitespace_ids(response_ids)
+            score_answer_ids = list(final_answer_ids) if final_answer_eligible else []
+            if not score_answer_ids and not self.anchor_precompute_final_answer_only:
+                score_answer_ids = self._strip_leading_whitespace_ids(response_ids)
             while not score_answer_ids and retry_count < self.anchor_precompute_empty_response_retries:
                 retry_count += 1
                 logger.warning("IF anchor precompute got an empty answer; retrying generation (%d/%d)", retry_count, self.anchor_precompute_empty_response_retries)
@@ -511,9 +514,13 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 response_ids = token_output.token_ids[: self.response_length]
                 response_mask = [1] * len(response_ids)
                 final_answer_ids, final_answer_eligible = self._extract_final_answer_ids(response_ids, prompt_ids)
-                score_answer_ids = list(final_answer_ids) if final_answer_eligible else self._strip_leading_whitespace_ids(response_ids)
+                score_answer_ids = list(final_answer_ids) if final_answer_eligible else []
+                if not score_answer_ids and not self.anchor_precompute_final_answer_only:
+                    score_answer_ids = self._strip_leading_whitespace_ids(response_ids)
             if retry_count:
                 metrics["anchor_precompute_empty_response_retries"] = retry_count
+            if not score_answer_ids:
+                metrics["anchor_precompute_missing_final_answer"] = 1
         ppl_extra_fields = {
             "if_final_answer_ids": list(final_answer_ids) if final_answer_eligible else [],
         }
@@ -532,12 +539,27 @@ class SingleTurnAgentLoop(AgentLoopBase):
                     apply_chat_template_kwargs=self._nonreason_chat_template_kwargs(),
                 )
                 ppl_extra_fields["ppl_x_prompt_ids"] = list(x_prompt_ids)
-                score_answer_ids = list(final_answer_ids) if final_answer_eligible else self._strip_leading_whitespace_ids(response_ids)
+                score_answer_ids = list(final_answer_ids) if final_answer_eligible else []
+                if not score_answer_ids and not (
+                    kwargs.get("__if_anchor_precompute__", False) and self.anchor_precompute_final_answer_only
+                ):
+                    score_answer_ids = self._strip_leading_whitespace_ids(response_ids)
                 ppl_extra_fields["ppl_y_final_answer_ids"] = list(score_answer_ids)
-                if kwargs.get("__if_anchor_precompute__", False) and score_answer_ids:
-                    ppl_extra_fields.update(
-                        await self._score_continuation_ppl(x_prompt_ids, score_answer_ids, "p_y_given_x")
-                    )
+                if kwargs.get("__if_anchor_precompute__", False):
+                    if score_answer_ids:
+                        ppl_extra_fields.update(
+                            await self._score_continuation_ppl(x_prompt_ids, score_answer_ids, "p_y_given_x")
+                        )
+                    else:
+                        ppl_extra_fields.update(
+                            {
+                                "p_y_given_x_ppl": float("inf"),
+                                "p_y_given_x_mean_logprob": None,
+                                "p_y_given_x_nll": float("inf"),
+                                "p_y_given_x_token_count": 0,
+                                "p_y_given_x_eligible": False,
+                            }
+                        )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("##6/3 ppl## ref-policy PPL token prep failed: %s", exc)
         extra_fields = dict(token_output.extra_fields)

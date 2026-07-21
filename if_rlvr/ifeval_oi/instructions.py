@@ -181,7 +181,7 @@ class ResponseLanguageChecker(Instruction):
             return langdetect.detect(value) == self._language
         except langdetect.LangDetectException as e:
             # Count as instruction is not followed when language detection fails.
-            logging.error("Unable to detect language for text %s due to %s", value, e)  # refex: disable=pytotw.037
+            logging.error("Unable to detect language for text %.80s due to %s", value, e)  # refex: disable=pytotw.037
             return False
 
 
@@ -1358,7 +1358,7 @@ class CapitalLettersEnglishChecker(Instruction):
             return value.isupper() and langdetect.detect(value) == "en"
         except langdetect.LangDetectException as e:
             # Count as instruction is not followed when language detection fails.
-            logging.error("Unable to detect language for text %s due to %s", value, e)  # refex: disable=pytotw.037
+            logging.error("Unable to detect language for text %.80s due to %s", value, e)  # refex: disable=pytotw.037
             return False
 
 
@@ -1387,7 +1387,7 @@ class LowercaseLettersEnglishChecker(Instruction):
             return value.islower() and langdetect.detect(value) == "en"
         except langdetect.LangDetectException as e:
             # Count as instruction is not followed when language detection fails.
-            logging.error("Unable to detect language for text %s due to %s", value, e)  # refex: disable=pytotw.037
+            logging.error("Unable to detect language for text %.80s due to %s", value, e)  # refex: disable=pytotw.037
             return False
 
 
@@ -2451,11 +2451,11 @@ class CountIncrementWordChecker(Instruction):
         A string representing the instruction description.
         """
         if not keyword1:
-            self._keyword1 = instructions_util.generate_keywords(num_keywords=1)
+            self._keyword1 = instructions_util.generate_keywords(num_keywords=1)[0]
         else:
             self._keyword1 = keyword1.strip()
         if not keyword2:
-            self._keyword2 = instructions_util.generate_keywords(num_keywords=1)
+            self._keyword2 = instructions_util.generate_keywords(num_keywords=1)[0]
         else:
             self._keyword2 = keyword2.strip()
 

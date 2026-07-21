@@ -14,11 +14,7 @@
 
 set -xeuo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-VERL_DIR=${VERL_DIR:-$(cd -- "${SCRIPT_DIR}/../../.." && pwd)}
-IFIF_DIR=${IFIF_DIR:-$(cd -- "${VERL_DIR}/.." && pwd)}
-
-CACHE_ROOT=${CACHE_ROOT:-${VERL_DIR}/.cache}
+CACHE_ROOT=${CACHE_ROOT:-/NHNHOME/WORKSPACE/26msit001_A/IFIF/if-rlvr/.cache}
 RUN_TMPDIR=${RUN_TMPDIR:-/var/tmp}
 mkdir -p "$CACHE_ROOT"/{torchinductor,triton} "$RUN_TMPDIR"
 
@@ -27,7 +23,7 @@ export TRITON_CACHE_DIR="$CACHE_ROOT/triton"
 export TMPDIR="$RUN_TMPDIR"
 
 ########################### NLTK data ###########################
-NLTK_DATA_DIR=${NLTK_DATA_DIR:-${IFIF_DIR}/IFBench/.nltk_data}
+NLTK_DATA_DIR=${NLTK_DATA_DIR:-/NHNHOME/WORKSPACE/26msit001_A/IFIF/IFBench/.nltk_data}
 mkdir -p "${NLTK_DATA_DIR}"
 export NLTK_DATA="${NLTK_DATA_DIR}"
 
@@ -58,6 +54,7 @@ PY
 ########################### end NLTK data ###########################
 
 ########################### runtime selection (non-invasive) ###########################
+VERL_DIR=${VERL_DIR:-/NHNHOME/WORKSPACE/26msit001_A/IFIF/if-rlvr/}
 export PYTHONPATH="${VERL_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 IF_RLVR_DIR=${IF_RLVR_DIR:-${VERL_DIR}/if_rlvr}
 REWARD_FN_PATH="${IF_RLVR_DIR}/if_reward_fn.py"
@@ -99,8 +96,8 @@ if_ref_ppl_gate=${IF_REF_PPL_GATE:-false}  # unused in anchor mode; lower gate i
 if_ref_ppl_gate_margin=${IF_REF_PPL_GATE_MARGIN:-0.0}
 if_ref_anchor_precompute=${IF_REF_ANCHOR_PRECOMPUTE:-true}
 if_ref_policy_anchor_ppl=${IF_REF_POLICY_ANCHOR_PPL:-true}
-if_ref_anchor_precompute_batch_size=${IF_REF_ANCHOR_PRECOMPUTE_BATCH_SIZE:-16384}
-agent_num_workers=${AGENT_NUM_WORKERS:-32}
+if_ref_anchor_precompute_batch_size=${IF_REF_ANCHOR_PRECOMPUTE_BATCH_SIZE:-4096}
+agent_num_workers=${AGENT_NUM_WORKERS:-256}
 if_ref_anchor_cache_path=${IF_REF_ANCHOR_CACHE_PATH:-${CACHE_ROOT}/if_ref_anchor_qwen3_4b_const1_train_seed${IF_DATA_SEED}_val${IF_VAL_SIZE}_thinkfalse.json}
 if_ref_anchor_cache_metadata_strict=${IF_REF_ANCHOR_CACHE_METADATA_STRICT:-false}
 if_ref_anchor_skip_missing_precompute=${IF_REF_ANCHOR_SKIP_MISSING_PRECOMPUTE:-false}
@@ -115,12 +112,12 @@ px_given_y_reward_coeff=${PX_GIVEN_Y_REWARD_COEFF:-0.0}  # ##6/3 ppl## p(x|y)
 clipped_rollout_mode=${CLIPPED_ROLLOUT_MODE:-use}  # ##6/3 ppl## use|zero|drop
 
 rollout_tp=${ROLLOUT_TP:-1}
-rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.8}
+rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.9}
 rollout_n=${ROLLOUT_N:-8}
 presence_penalty=${PRESENCE_PENALTY:-0.0}
 sp_size=${SP_SIZE:-1}
 
-total_epochs=${TOTAL_EPOCHS:-4}
+total_epochs=${TOTAL_EPOCHS:-3}
 save_freq=${SAVE_FREQ:-25}
 test_freq=${TEST_FREQ:-1000}
 
@@ -131,6 +128,7 @@ export WANDB_ENTITY
 ########################### end user-adjustable ###########################
 
 ########################### concurrent local run isolation ###########################
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "${SCRIPT_DIR}/_concurrent_run_env.sh"
 ########################### end concurrent local run isolation ###########################
 
