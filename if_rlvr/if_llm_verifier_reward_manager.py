@@ -1,8 +1,9 @@
 """IF reward manager with an external LLM verifier bonus.
 
-Reward = IFEval constraint score + bonus, where the bonus is applied only when
-the constraint score is positive and the LLM judge score is at least the
-configured threshold.
+By default, reward is the IFEval constraint score plus an optional verifier
+bonus.  The opt-in anchor-fallback mode also supports two-phase scoring so the
+trainer can run the verifier only for constraint-positive rollouts that did not
+receive the anchor interval bonus.
 """
 
 from __future__ import annotations
@@ -303,6 +304,14 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
         self.response_format = _as_bool(
             _get_with_env(kwargs, "if_llm_verifier_response_format", "IF_LLM_VERIFIER_RESPONSE_FORMAT", False)
         )
+        self.anchor_fallback_only = _as_bool(
+            _get_with_env(
+                kwargs,
+                "if_llm_verifier_anchor_fallback_only",
+                "IF_LLM_VERIFIER_ANCHOR_FALLBACK_ONLY",
+                False,
+            )
+        )
         self.require_think_end = _as_bool(os.getenv("IF_REQUIRE_THINK_END_FOR_REWARD"), False)
 
         try:
@@ -312,7 +321,8 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
 
         logger.warning(
             "IFLLMVerifierRewardManager: model=%s endpoints=%s threshold=%s bonus=%s "
-            "response_format=%s omit_max_tokens=%s enable_thinking=%s reasoning_effort=%s",
+            "response_format=%s omit_max_tokens=%s enable_thinking=%s reasoning_effort=%s "
+            "anchor_fallback_only=%s",
             self.model,
             ",".join(self.base_urls) or f"router:{self.reward_router_address}",
             self.threshold,
@@ -321,6 +331,7 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
             self.omit_max_tokens,
             self.enable_thinking if self.enable_thinking is not None else "<default>",
             self.reasoning_effort or "<default>",
+            self.anchor_fallback_only,
         )
 
     def _endpoint_url(self, prompt: str = "", response: str = "") -> str | None:
@@ -397,12 +408,31 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
         )
         base_reward = self.verification_reward * float(constraint_score)
 
+        phase_value = data_item.non_tensor_batch.get("if_llm_verifier_phase", "combined")
+        if hasattr(phase_value, "item"):
+            phase_value = phase_value.item()
+        phase = str(phase_value or "combined").strip().lower()
+        if phase not in {"combined", "constraint", "verifier"}:
+            raise ValueError(f"Unsupported if_llm_verifier_phase={phase!r}")
+        if self.anchor_fallback_only and phase == "combined":
+            # Validation and other legacy paths do not have anchor classification.
+            # Keep them constraint-only instead of accidentally double-awarding.
+            phase = "constraint"
+
+        requested_value = data_item.non_tensor_batch.get("if_llm_verifier_eligible", False)
+        if hasattr(requested_value, "item"):
+            requested_value = requested_value.item()
+        requested_for_fallback = _as_bool(requested_value, False)
+        verifier_eligible = constraint_score > 0.0 and (
+            phase == "combined" or (phase == "verifier" and requested_for_fallback)
+        )
+
         judge_called = False
         judge_score = None
         raw_judgment = None
         judge_error = None
         bonus = 0.0
-        if constraint_score > 0.0:
+        if verifier_eligible:
             judge_called = True
             judge_response = remove_thinking_section(response_str, require_think_end=False)
             if judge_response is None:
@@ -411,7 +441,12 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
             if judge_score is not None and judge_score >= self.threshold:
                 bonus = self.bonus
 
-        reward = base_reward + bonus
+        if phase == "verifier":
+            # The trainer applies this after anchor shaping and, on a pass,
+            # restores any constraint reward that the T4B lower gate zeroed.
+            reward = bonus
+        else:
+            reward = base_reward + (bonus if phase == "combined" else 0.0)
         return {
             "reward_score": float(reward),
             "reward_extra_info": {
@@ -419,12 +454,14 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
                 "verifier_score": float(constraint_score),
                 "constraint_reward": float(base_reward),
                 "llm_verifier_called": float(judge_called),
+                "llm_verifier_eligible": float(verifier_eligible),
                 "llm_verifier_score": float(judge_score if judge_score is not None else -1),
                 "llm_verifier_pass": float(judge_score is not None and judge_score >= self.threshold),
                 "llm_verifier_bonus": float(bonus),
                 "llm_verifier_error": judge_error or "",
                 "llm_verifier_prompt_source": "ppl_prompt",
                 "llm_verifier_raw_judgment": (raw_judgment or "")[:500],
+                "llm_verifier_phase": phase,
                 "scaled_reward": float(reward),
                 "valid_response_length": int(valid_response_length),
             },

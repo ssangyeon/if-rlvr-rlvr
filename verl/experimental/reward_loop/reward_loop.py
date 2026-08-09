@@ -290,6 +290,13 @@ class RewardLoopManager:
             "yes",
             "on",
         }
+        fallback_only = reward_kwargs.get("if_llm_verifier_anchor_fallback_only", False)
+        self.external_verifier_anchor_fallback_only = str(fallback_only).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self.external_verifier_sleep_level = int(reward_kwargs.get("if_llm_verifier_sleep_level", 1))
         self.external_verifier_control_timeout = float(
             reward_kwargs.get("if_llm_verifier_control_timeout", 300)
@@ -360,6 +367,18 @@ class RewardLoopManager:
             self._wait_external_verifier_sleep_state(base_url, sleeping)
         logger.warning("External verifier %s complete: %s", action, self.external_verifier_base_urls)
 
+    def _batch_needs_external_verifier(self, data: DataProto) -> bool:
+        phases = data.non_tensor_batch.get("if_llm_verifier_phase")
+        if phases is None:
+            return not self.external_verifier_anchor_fallback_only
+        normalized_phases = [str(value).strip().lower() for value in phases]
+        if normalized_phases and all(phase == "constraint" for phase in normalized_phases):
+            return False
+        eligible = data.non_tensor_batch.get("if_llm_verifier_eligible")
+        if normalized_phases and all(phase == "verifier" for phase in normalized_phases) and eligible is not None:
+            return any(str(value).strip().lower() in {"1", "true", "yes", "on"} for value in eligible)
+        return True
+
     @property
     def reward_loop_worker_handles(self) -> list[ActorHandle]:
         """Return worker handles for agent loop worker to compute reward score.
@@ -392,9 +411,11 @@ class RewardLoopManager:
             )
 
     def compute_rm_score(self, data: DataProto) -> DataProto:
+        needs_external_verifier = self._batch_needs_external_verifier(data)
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
-        self._set_external_verifier_sleep(False)
+        if needs_external_verifier:
+            self._set_external_verifier_sleep(False)
 
         try:
             chunks = data.chunk(len(self.reward_loop_workers))
@@ -405,7 +426,8 @@ class RewardLoopManager:
                 ]
             )
         finally:
-            self._set_external_verifier_sleep(True)
+            if needs_external_verifier:
+                self._set_external_verifier_sleep(True)
             if self.reward_model_manager is not None:
                 self.reward_model_manager.sleep()
         outputs_flat = [item for sublist in outputs for item in sublist]

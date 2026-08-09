@@ -94,15 +94,68 @@ class SingleTurnAgentLoop(AgentLoopBase):
         self.defer_ppl_to_ref_policy = str(
             self.config.get("if_ref_policy_anchor_ppl", os.getenv("IF_REF_POLICY_ANCHOR_PPL", "0"))
         ).strip().lower() in {"1", "true", "yes", "on"}
+        self.ppl_prefix_mode = str(
+            self.config.get("if_ppl_prefix_mode", os.getenv("IF_PPL_PREFIX_MODE", "standard"))
+        ).strip().lower()
+        if self.ppl_prefix_mode not in {"standard", "empty_think"}:
+            raise ValueError(
+                f"Unsupported if_ppl_prefix_mode={self.ppl_prefix_mode!r}; "
+                "expected 'standard' or 'empty_think'"
+            )
         self.apply_enable_thinking_kwarg = _env_bool("IF_APPLY_ENABLE_THINKING_KWARG", True)
         self.allow_missing_think_final_answer = _env_bool("IF_ALLOW_MISSING_THINK_FINAL_ANSWER", False)
         self.anchor_precompute_final_answer_only = _env_bool("IF_ANCHOR_PRECOMPUTE_FINAL_ANSWER_ONLY", False)
         self.anchor_precompute_empty_response_retries = int(os.getenv("IF_ANCHOR_PRECOMPUTE_EMPTY_RESPONSE_RETRIES", "2"))
+        self.anchor_precompute_min_tokens = int(os.getenv("IF_ANCHOR_PRECOMPUTE_MIN_TOKENS", "0"))
+        if self.anchor_precompute_min_tokens < 0:
+            raise ValueError("IF_ANCHOR_PRECOMPUTE_MIN_TOKENS must be non-negative")
         self._ref_ppl_cache: dict[tuple[int, ...], dict[str, Any]] = {}
         self._ref_xc_ppl_cache: dict[tuple[int, ...], dict[str, Any]] = {}
 
     def _nonreason_chat_template_kwargs(self) -> dict[str, Any]:
         return {"enable_thinking": False} if self.apply_enable_thinking_kwarg else {}
+
+    async def _build_ppl_x_prompt_ids(self, ppl_prompt) -> list[int]:
+        """Build the x-side PPL prefix, optionally forcing an empty reasoning block.
+
+        The Think chat template already ends in a tokenized ``<think>``.  The
+        closing marker is appended as a forced continuation so the scorer sees
+        ``<think></think>\n\n`` while all of those tokens remain in the prompt
+        (only the separately supplied final-answer tokens receive NLL).
+        """
+        prefix_ids = list(
+            await self.apply_chat_template(
+                list(ppl_prompt),
+                apply_chat_template_kwargs=self._nonreason_chat_template_kwargs(),
+            )
+        )
+        if self.ppl_prefix_mode == "standard":
+            return prefix_ids
+
+        open_think_ids = list(self.tokenizer.encode("<think>", add_special_tokens=False))
+        close_think_ids = list(self.tokenizer.encode("</think>\n\n", add_special_tokens=False))
+        closed_suffix = open_think_ids + close_think_ids
+        if prefix_ids[-len(closed_suffix) :] == closed_suffix:
+            return prefix_ids
+        if not open_think_ids or prefix_ids[-len(open_think_ids) :] != open_think_ids:
+            raise RuntimeError(
+                "if_ppl_prefix_mode=empty_think requires a chat template ending in '<think>'"
+            )
+
+        prefix_ids.extend(close_think_ids)
+        try:
+            decoded_suffix = self.tokenizer.decode(
+                prefix_ids[-len(closed_suffix) :],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        except TypeError:
+            decoded_suffix = self.tokenizer.decode(prefix_ids[-len(closed_suffix) :], skip_special_tokens=False)
+        if decoded_suffix != "<think></think>\n\n":
+            raise RuntimeError(
+                "empty-think PPL prefix tokenization did not decode to '<think></think>\\n\\n'"
+            )
+        return prefix_ids
 
     @staticmethod
     def _find_subsequence(sequence: list[int], pattern: list[int]) -> int | None:
@@ -181,13 +234,37 @@ class SingleTurnAgentLoop(AgentLoopBase):
         if gemma_final_answer is not None:
             return gemma_final_answer
 
-        think_end_ids = self.tokenizer.encode("</think>", add_special_tokens=False)
-        marker_pos = self._find_subsequence(response_ids, think_end_ids)
-        if marker_pos is not None:
-            final_answer_ids = self._strip_leading_whitespace_ids(response_ids[marker_pos + len(think_end_ids) :])
+        # The closing think marker is ordinary byte-BPE text for tokenizers such
+        # as OLMo's, so its token ids change when adjacent whitespace is merged.
+        # Split the decoded response instead of matching isolated token ids.
+        marker = "</think>"
+        try:
+            response_text = self.tokenizer.decode(
+                response_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        except TypeError:
+            response_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
+        marker_pos = response_text.find(marker)
+        if marker_pos != -1:
+            final_answer_text = response_text[marker_pos + len(marker) :]
+            final_answer_ids = self._strip_leading_whitespace_ids(
+                self.tokenizer.encode(final_answer_text, add_special_tokens=False)
+            )
             return final_answer_ids, len(final_answer_ids) > 0
-        recent_prompt_ids = prompt_ids[-max(64, len(think_end_ids) + 8) :]
-        if self._find_subsequence(recent_prompt_ids, think_end_ids) is not None:
+
+        try:
+            prompt_text = self.tokenizer.decode(
+                prompt_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        except TypeError:
+            prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+        prompt_marker_pos = prompt_text.rfind(marker)
+        prompt_after_marker = prompt_text[prompt_marker_pos + len(marker) :] if prompt_marker_pos != -1 else ""
+        if prompt_marker_pos != -1 and not prompt_after_marker.strip():
             final_answer_ids = self._strip_leading_whitespace_ids(response_ids)
             return final_answer_ids, len(final_answer_ids) > 0
         if self.allow_missing_think_final_answer:
@@ -370,10 +447,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         extra_fields = dict(defaults)
         x_prompt_ids = None
         try:
-            x_prompt_ids = await self.apply_chat_template(
-                list(ppl_prompt),
-                apply_chat_template_kwargs=self._nonreason_chat_template_kwargs(),
-            )
+            x_prompt_ids = await self._build_ppl_x_prompt_ids(ppl_prompt)
             extra_fields["ppl_x_prompt_ids"] = list(x_prompt_ids)
             extra_fields["ppl_y_final_answer_ids"] = list(final_answer_ids)
             if self.enable_py_given_x_ppl:
@@ -457,6 +531,15 @@ class SingleTurnAgentLoop(AgentLoopBase):
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
+        is_anchor_precompute = bool(kwargs.get("__if_anchor_precompute__", False))
+        if is_anchor_precompute and self.anchor_precompute_min_tokens:
+            # The cache validator requires a non-empty continuation. Setting a
+            # one-token floor is equivalent to rejecting an immediate EOS and
+            # retrying, without altering ordinary training rollouts.
+            sampling_params = dict(sampling_params)
+            sampling_params["min_tokens"] = max(
+                int(sampling_params.get("min_tokens", 0) or 0), self.anchor_precompute_min_tokens
+            )
 
         # 1. extract multimodal inputs from messages
         multi_modal_data = await self.process_multi_modal_info(messages)
@@ -493,7 +576,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
         # ##6/3 ppl## Score all rollouts while vLLM is still awake; trainer later gates by old reward.
         final_answer_ids, final_answer_eligible = self._extract_final_answer_ids(response_ids, prompt_ids)
-        if kwargs.get("__if_anchor_precompute__", False):
+        if is_anchor_precompute:
             retry_count = 0
             score_answer_ids = list(final_answer_ids) if final_answer_eligible else []
             if not score_answer_ids and not self.anchor_precompute_final_answer_only:
@@ -534,10 +617,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             )
         elif kwargs.get("ppl_prompt") and (kwargs.get("__if_anchor_precompute__", False) or self.defer_ppl_to_ref_policy):
             try:
-                x_prompt_ids = await self.apply_chat_template(
-                    list(kwargs.get("ppl_prompt")),
-                    apply_chat_template_kwargs=self._nonreason_chat_template_kwargs(),
-                )
+                x_prompt_ids = await self._build_ppl_x_prompt_ids(kwargs.get("ppl_prompt"))
                 ppl_extra_fields["ppl_x_prompt_ids"] = list(x_prompt_ids)
                 score_answer_ids = list(final_answer_ids) if final_answer_eligible else []
                 if not score_answer_ids and not (

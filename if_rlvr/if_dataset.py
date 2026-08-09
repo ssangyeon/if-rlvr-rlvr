@@ -134,6 +134,37 @@ def _complete_anchor_cache_indices(path: str) -> set[int] | None:
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"Failed to load IF ref anchor cache for dataset filtering: {path}: {exc}") from exc
 
+    expected_prefix_mode = os.getenv("IF_PPL_PREFIX_MODE", "").strip().lower()
+    if expected_prefix_mode:
+        metadata = payload.get("metadata", {})
+        actual_prefix_mode = str(metadata.get("ppl_prefix_mode", "")).strip().lower()
+        actual_nll_scope = str(metadata.get("ppl_nll_scope", "")).strip().lower()
+        expected_model_path = os.getenv("MODEL_PATH", "").strip()
+        try:
+            cache_version = int(metadata.get("version", -1))
+        except (TypeError, ValueError):
+            cache_version = -1
+        legacy_final_answer_cache_compatible = (
+            _env_bool("IF_REF_ANCHOR_ALLOW_LEGACY_FINAL_ANSWER_CACHE", False)
+            and cache_version == 2
+            and expected_prefix_mode == "standard"
+            and "ppl_prefix_mode" not in metadata
+            and "ppl_nll_scope" not in metadata
+            and (not expected_model_path or metadata.get("model_path") == expected_model_path)
+        )
+        if legacy_final_answer_cache_compatible:
+            actual_prefix_mode = "standard"
+            actual_nll_scope = "final_answer_tokens_only"
+            print(
+                f"[IFMultiConstraintsDataset] accepting legacy v2 final-answer cache semantics: {path}"
+            )
+        if actual_prefix_mode != expected_prefix_mode or actual_nll_scope != "final_answer_tokens_only":
+            raise RuntimeError(
+                "IF ref anchor cache PPL semantics mismatch: "
+                f"expected prefix_mode={expected_prefix_mode!r}, nll_scope='final_answer_tokens_only'; "
+                f"got prefix_mode={actual_prefix_mode!r}, nll_scope={actual_nll_scope!r}: {path}"
+            )
+
     indices: set[int] = set()
     for key, item in payload.get("items", {}).items():
         try:

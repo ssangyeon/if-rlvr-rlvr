@@ -503,15 +503,20 @@ def apply_if_ppl_anchor_reward(
         policy_mean_nll = policy_nll / policy_count
         ref0_mean_nll = ref0_nll / ref0_count
         ref1_mean_nll = ref1_nll / ref1_count
+        if ref1_mean_nll < ref0_mean_nll:
+            # An inverted pair does not define the intended [x-only, x+c] interval.
+            # Preserve the original IF reward instead of letting the lower-bound
+            # branch cancel it.
+            invalid_anchor_count += 1
+            continue
         if anchor_reward_mode != "no_lower_zero" and policy_mean_nll < ref0_mean_nll:
             bonus[idx] = -base_scores[idx]
             lower_zero_count += 1
-        elif anchor_reward_mode != "lower_zero_only" and ref1_mean_nll >= ref0_mean_nll and policy_mean_nll <= ref1_mean_nll:
+        elif anchor_reward_mode != "lower_zero_only" and policy_mean_nll <= ref1_mean_nll:
             bonus[idx] += float(ppl_reward_coeff)
             interval_bonus_count += 1
         else:
-            above_ref1_count += int(ref1_mean_nll >= ref0_mean_nll and policy_mean_nll > ref1_mean_nll)
-            invalid_anchor_count += int(ref1_mean_nll < ref0_mean_nll)
+            above_ref1_count += int(policy_mean_nll > ref1_mean_nll)
 
     updated_reward = reward_tensor
     if torch.count_nonzero(bonus).item() > 0:
@@ -550,6 +555,197 @@ def apply_if_ppl_anchor_reward(
         f"{metric_prefix}/composed_reward/min": float(composed_reward_scores.min().cpu().item()),
     }
     return updated_reward, metrics
+
+
+def get_if_ppl_anchor_interval_bonus_mask(
+    batch: DataProto,
+    gate_scores: torch.Tensor,
+    ppl_reward_coeff: float = 1.0,
+    anchor_reward_mode: Any = "both",
+    policy_nll_key: str = "p_y_given_x_nll",
+    policy_token_count_key: str = "p_y_given_x_token_count",
+    ref0_nll_key: str = "p_y_ref_given_x_nll",
+    ref0_token_count_key: str = "p_y_ref_given_x_token_count",
+    ref1_nll_key: str = "p_y_ref_xc_given_x_nll",
+    ref1_token_count_key: str = "p_y_ref_xc_given_x_token_count",
+    strict: bool = False,
+) -> np.ndarray:
+    """Return rows that will receive the positive anchor interval bonus."""
+    anchor_reward_mode = normalize_if_ppl_anchor_reward_mode(anchor_reward_mode)
+    gate_values = gate_scores.detach().to(device="cpu", dtype=torch.float64).numpy()
+    interval_mask = np.zeros(len(gate_values), dtype=bool)
+    if float(ppl_reward_coeff) <= 0.0 or anchor_reward_mode == "lower_zero_only":
+        return interval_mask
+
+    required = [
+        policy_nll_key,
+        policy_token_count_key,
+        ref0_nll_key,
+        ref0_token_count_key,
+        ref1_nll_key,
+        ref1_token_count_key,
+    ]
+    missing = [key for key in required if key not in batch.non_tensor_batch]
+    if missing:
+        if strict:
+            raise RuntimeError(f"Anchor fallback requires PPL fields, but missing: {missing}")
+        return interval_mask
+
+    def float_at(key: str, idx: int) -> float:
+        try:
+            return float(batch.non_tensor_batch[key][idx])
+        except (IndexError, TypeError, ValueError):
+            return float("inf")
+
+    def int_at(key: str, idx: int) -> int:
+        try:
+            return int(batch.non_tensor_batch[key][idx])
+        except (IndexError, TypeError, ValueError):
+            return 0
+
+    for idx, gate_value in enumerate(gate_values):
+        if float(gate_value) <= 0.0:
+            continue
+        policy_nll = float_at(policy_nll_key, idx)
+        ref0_nll = float_at(ref0_nll_key, idx)
+        ref1_nll = float_at(ref1_nll_key, idx)
+        policy_count = int_at(policy_token_count_key, idx)
+        ref0_count = int_at(ref0_token_count_key, idx)
+        ref1_count = int_at(ref1_token_count_key, idx)
+        if not (
+            np.isfinite(policy_nll)
+            and np.isfinite(ref0_nll)
+            and np.isfinite(ref1_nll)
+            and policy_count > 0
+            and ref0_count > 0
+            and ref1_count > 0
+        ):
+            continue
+        policy_mean_nll = policy_nll / policy_count
+        ref0_mean_nll = ref0_nll / ref0_count
+        ref1_mean_nll = ref1_nll / ref1_count
+        if ref1_mean_nll < ref0_mean_nll:
+            continue
+        interval_mask[idx] = ref0_mean_nll <= policy_mean_nll <= ref1_mean_nll
+    return interval_mask
+
+
+def build_if_llm_verifier_fallback_mask(
+    constraint_scores: torch.Tensor, anchor_interval_bonus_mask: np.ndarray
+) -> np.ndarray:
+    """Gate the verifier to positive-constraint rows without an anchor bonus."""
+    constraint_positive = constraint_scores.detach().to(device="cpu", dtype=torch.float64).numpy() > 0.0
+    interval_mask = np.asarray(anchor_interval_bonus_mask, dtype=bool)
+    if len(constraint_positive) != len(interval_mask):
+        raise ValueError(
+            "Constraint and anchor interval masks must have equal length: "
+            f"{len(constraint_positive)} != {len(interval_mask)}"
+        )
+    return constraint_positive & ~interval_mask
+
+
+def apply_if_llm_verifier_fallback_bonus(
+    batch: DataProto,
+    reward_tensor: torch.Tensor,
+    fallback_bonus_scores: torch.Tensor,
+    constraint_scores: torch.Tensor,
+    metric_prefix: str = "if_llm_verifier_fallback",
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Apply deferred verifier bonuses, restoring lower-zeroed constraints on a pass."""
+    bonuses = fallback_bonus_scores.detach().to(device=reward_tensor.device, dtype=reward_tensor.dtype)
+    constraints = constraint_scores.detach().to(device=reward_tensor.device, dtype=reward_tensor.dtype)
+    if bonuses.ndim != 1 or bonuses.shape[0] != reward_tensor.shape[0]:
+        raise ValueError(
+            "Verifier fallback bonuses must be one value per row: "
+            f"shape={tuple(bonuses.shape)}, rows={reward_tensor.shape[0]}"
+        )
+    if constraints.ndim != 1 or constraints.shape[0] != reward_tensor.shape[0]:
+        raise ValueError(
+            "Constraint scores must be one value per row: "
+            f"shape={tuple(constraints.shape)}, rows={reward_tensor.shape[0]}"
+        )
+    if torch.any(bonuses < 0):
+        raise ValueError("Verifier fallback bonuses must be non-negative")
+
+    post_anchor_scores = reward_tensor.sum(dim=-1)
+    anchor_zero_mask = torch.isclose(
+        post_anchor_scores,
+        torch.zeros_like(post_anchor_scores),
+        atol=1e-7,
+        rtol=0.0,
+    )
+    restore_mask = (bonuses > 0) & (constraints > 0) & anchor_zero_mask
+    restored_constraints = torch.where(restore_mask, constraints, torch.zeros_like(constraints))
+    reward_adjustments = bonuses + restored_constraints
+
+    updated_reward = reward_tensor
+    if torch.count_nonzero(reward_adjustments).item() > 0:
+        updated_reward = reward_tensor.clone()
+        response_mask = batch.batch["response_mask"]
+        last_response_positions = (response_mask.sum(dim=-1).long() - 1).clamp_min(0)
+        row_indices = torch.arange(updated_reward.size(0), device=updated_reward.device)
+        updated_reward[row_indices, last_response_positions] += reward_adjustments
+
+    return updated_reward, {
+        f"{metric_prefix}/positive_bonus_count": float(torch.count_nonzero(bonuses > 0).item()),
+        f"{metric_prefix}/bonus_mean": float(bonuses.float().mean().cpu().item()),
+        f"{metric_prefix}/bonus_max": float(bonuses.float().max().cpu().item()),
+        f"{metric_prefix}/restored_constraint_count": float(torch.count_nonzero(restore_mask).item()),
+        f"{metric_prefix}/restored_constraint_mean": float(
+            restored_constraints.float().mean().cpu().item()
+        ),
+        f"{metric_prefix}/total_adjustment_mean": float(
+            reward_adjustments.float().mean().cpu().item()
+        ),
+    }
+
+
+def collect_if_llm_verifier_metrics(reward_extra_infos_dict: dict[str, Any]) -> dict[str, float]:
+    if "llm_verifier_called" not in reward_extra_infos_dict:
+        return {}
+    verifier_called = np.asarray(reward_extra_infos_dict["llm_verifier_called"], dtype=np.float32)
+    called_mask = verifier_called > 0.5
+    called_count = int(np.sum(called_mask))
+    metrics = {
+        "if_llm_verifier/called_ratio": float(np.mean(verifier_called)),
+        "if_llm_verifier/called_count": float(called_count),
+    }
+    if "llm_verifier_eligible" in reward_extra_infos_dict:
+        eligible = np.asarray(reward_extra_infos_dict["llm_verifier_eligible"], dtype=np.float32)
+        metrics["if_llm_verifier/eligible_ratio"] = float(np.mean(eligible))
+        metrics["if_llm_verifier/eligible_count"] = float(np.sum(eligible > 0.5))
+    if "llm_verifier_score" in reward_extra_infos_dict:
+        verifier_scores = np.asarray(reward_extra_infos_dict["llm_verifier_score"], dtype=np.float32)
+        valid_score_mask = called_mask & np.isfinite(verifier_scores) & (verifier_scores >= 1)
+        valid_scores = verifier_scores[valid_score_mask]
+        metrics.update(
+            {
+                "if_llm_verifier/score_mean": float(np.mean(valid_scores)) if valid_scores.size else 0.0,
+                "if_llm_verifier/score_max": float(np.max(valid_scores)) if valid_scores.size else 0.0,
+                "if_llm_verifier/score_min": float(np.min(valid_scores)) if valid_scores.size else 0.0,
+            }
+        )
+    if "llm_verifier_pass" in reward_extra_infos_dict:
+        verifier_pass = np.asarray(reward_extra_infos_dict["llm_verifier_pass"], dtype=np.float32)
+        metrics["if_llm_verifier/pass_rate"] = (
+            float(np.mean(verifier_pass[called_mask])) if called_count else 0.0
+        )
+    if "llm_verifier_bonus" in reward_extra_infos_dict:
+        verifier_bonus = np.asarray(reward_extra_infos_dict["llm_verifier_bonus"], dtype=np.float32)
+        metrics["if_llm_verifier/bonus_mean"] = float(np.mean(verifier_bonus))
+    if "llm_verifier_error" in reward_extra_infos_dict:
+        verifier_errors = np.asarray(reward_extra_infos_dict["llm_verifier_error"], dtype=object)
+        called_errors = verifier_errors[called_mask]
+        metrics["if_llm_verifier/error_rate"] = (
+            float(np.mean([bool(str(error).strip()) for error in called_errors])) if called_count else 0.0
+        )
+    if "constraint_reward" in reward_extra_infos_dict:
+        constraint_rewards = np.asarray(reward_extra_infos_dict["constraint_reward"], dtype=np.float32)
+        metrics["if_llm_verifier/constraint_reward_mean"] = float(np.mean(constraint_rewards))
+    if "scaled_reward" in reward_extra_infos_dict:
+        scaled_rewards = np.asarray(reward_extra_infos_dict["scaled_reward"], dtype=np.float32)
+        metrics["if_llm_verifier/scaled_reward_mean"] = float(np.mean(scaled_rewards))
+    return metrics
 
 def compute_spec_decode_metrics(
     spec_drafts,
@@ -1715,6 +1911,23 @@ class RayPPOTrainer:
                 result.append(int(item))
         return result
 
+    def _validate_ppl_x_prefix_ids(self, prefixes: list[list[int]]) -> None:
+        if str(self.config.get("if_ppl_prefix_mode", "standard")).strip().lower() != "empty_think":
+            return
+        expected_suffix = list(self.tokenizer.encode("<think>", add_special_tokens=False)) + list(
+            self.tokenizer.encode("</think>\n\n", add_special_tokens=False)
+        )
+        invalid_rows = [
+            index
+            for index, prefix in enumerate(prefixes)
+            if len(prefix) < len(expected_suffix) or prefix[-len(expected_suffix) :] != expected_suffix
+        ]
+        if invalid_rows:
+            raise RuntimeError(
+                "empty-think PPL scoring received prefixes that do not end in "
+                f"'<think></think>\\n\\n'; invalid rows: {invalid_rows[:8]}"
+            )
+
     def _build_ref_policy_scoring_batch(
         self, prefixes: list[list[int]], continuations: list[list[int]]
     ) -> tuple[DataProto | None, torch.Tensor | None]:
@@ -1795,7 +2008,9 @@ class RayPPOTrainer:
             ppls[original_idx] = math.exp(nll / count)
         return nlls, token_counts, ppls
 
-    def _compute_anchor_ppl_with_ref_policy(self, batch: DataProto) -> dict[str, float]:
+    def _compute_anchor_ppl_with_ref_policy(
+        self, batch: DataProto, eligible_mask: np.ndarray | None = None
+    ) -> dict[str, float]:
         if not normalize_bool_config(self.config.get("if_ref_policy_anchor_ppl", False)):
             return {}
         required = ["ppl_x_prompt_ids", "ppl_y_final_answer_ids"]
@@ -1803,8 +2018,22 @@ class RayPPOTrainer:
             return {"if_ref_policy_anchor_ppl/missing_fields": 1.0}
 
         prefixes = [list(ids or []) for ids in batch.non_tensor_batch["ppl_x_prompt_ids"]]
-        policy_y = [list(ids or []) for ids in batch.non_tensor_batch["ppl_y_final_answer_ids"]]
+        self._validate_ppl_x_prefix_ids(prefixes)
+        scoring_mask = None
+        if eligible_mask is not None:
+            scoring_mask = np.asarray(eligible_mask, dtype=bool)
+            if len(scoring_mask) != len(prefixes):
+                raise ValueError(
+                    "Anchor PPL eligibility mask must match the batch: "
+                    f"{len(scoring_mask)} != {len(prefixes)}"
+                )
+        policy_y = [
+            list(ids or []) if scoring_mask is None or scoring_mask[idx] else []
+            for idx, ids in enumerate(batch.non_tensor_batch["ppl_y_final_answer_ids"])
+        ]
         metrics: dict[str, float] = {"if_ref_policy_anchor_ppl/enabled": 1.0}
+        if scoring_mask is not None:
+            metrics["if_ref_policy_anchor_ppl/eligible_count"] = float(scoring_mask.sum())
 
         def has_cached_scores(prefix: str) -> bool:
             return (
@@ -1830,7 +2059,10 @@ class RayPPOTrainer:
         if has_cached_scores("p_y_ref_given_x"):
             log_cached_score_metrics("p_y_ref_given_x")
         elif "ppl_y_ref0_ids" in batch.non_tensor_batch:
-            ref0_y = [list(ids or []) for ids in batch.non_tensor_batch["ppl_y_ref0_ids"]]
+            ref0_y = [
+                list(ids or []) if scoring_mask is None or scoring_mask[idx] else []
+                for idx, ids in enumerate(batch.non_tensor_batch["ppl_y_ref0_ids"])
+            ]
             metric_specs.append(("p_y_ref_given_x", ref0_y))
         else:
             metrics["if_ref_policy_anchor_ppl/p_y_ref_given_x/missing_cache"] = 1.0
@@ -1838,7 +2070,10 @@ class RayPPOTrainer:
         if has_cached_scores("p_y_ref_xc_given_x"):
             log_cached_score_metrics("p_y_ref_xc_given_x")
         elif "ppl_y_ref1_ids" in batch.non_tensor_batch:
-            ref1_y = [list(ids or []) for ids in batch.non_tensor_batch["ppl_y_ref1_ids"]]
+            ref1_y = [
+                list(ids or []) if scoring_mask is None or scoring_mask[idx] else []
+                for idx, ids in enumerate(batch.non_tensor_batch["ppl_y_ref1_ids"])
+            ]
             metric_specs.append(("p_y_ref_xc_given_x", ref1_y))
         else:
             metrics["if_ref_policy_anchor_ppl/p_y_ref_xc_given_x/missing_cache"] = 1.0
@@ -1915,10 +2150,14 @@ class RayPPOTrainer:
 
     def _if_ref_anchor_cache_metadata(self) -> dict[str, Any]:
         data_cfg = self.config.data
+        ppl_prefix_mode = str(self.config.get("if_ppl_prefix_mode", "standard")).strip().lower()
         return {
-            "version": 2,
+            "version": 3,
             "model_path": str(self.config.actor_rollout_ref.model.path),
             "tokenizer_class": self.tokenizer.__class__.__name__,
+            "ppl_prefix_mode": ppl_prefix_mode,
+            "ppl_nll_scope": "final_answer_tokens_only",
+            "train_sample_count": int(len(self.train_dataset)),
             "train_files": list(data_cfg.get("train_files", [])),
             "if_dataset_hf": str(data_cfg.get("if_dataset_hf", "")),
             "if_dataset_seed": int(data_cfg.get("if_dataset_seed", 1)),
@@ -1954,6 +2193,38 @@ class RayPPOTrainer:
 
         expected_metadata = self._if_ref_anchor_cache_metadata()
         actual_metadata = payload.get("metadata", {})
+        semantic_keys = ("ppl_prefix_mode", "ppl_nll_scope")
+        semantic_mismatches = {
+            key: {"expected": expected_metadata.get(key), "actual": actual_metadata.get(key)}
+            for key in semantic_keys
+            if actual_metadata.get(key) != expected_metadata.get(key)
+        }
+        allow_legacy_final_answer_cache = normalize_bool_config(
+            self.config.get("if_ref_anchor_allow_legacy_final_answer_cache", False), False
+        )
+        try:
+            actual_cache_version = int(actual_metadata.get("version", -1))
+        except (TypeError, ValueError):
+            actual_cache_version = -1
+        legacy_final_answer_cache_compatible = (
+            allow_legacy_final_answer_cache
+            and actual_cache_version == 2
+            and expected_metadata.get("ppl_prefix_mode") == "standard"
+            and all(key not in actual_metadata for key in semantic_keys)
+            and actual_metadata.get("model_path") == expected_metadata.get("model_path")
+        )
+        if semantic_mismatches and not legacy_final_answer_cache_compatible:
+            print(
+                f"[IF ref anchor] cache PPL semantics mismatch for {path}: {semantic_mismatches}; "
+                "regenerating"
+            )
+            return False
+        if semantic_mismatches:
+            print(
+                f"[IF ref anchor] accepting legacy v2 final-answer cache {path} as "
+                "ppl_prefix_mode=standard, ppl_nll_scope=final_answer_tokens_only because "
+                "if_ref_anchor_allow_legacy_final_answer_cache=true"
+            )
         if actual_metadata != expected_metadata:
             metadata_strict = normalize_bool_config(self.config.get("if_ref_anchor_cache_metadata_strict", True), True)
             if not metadata_strict:
@@ -2023,7 +2294,19 @@ class RayPPOTrainer:
             tokenized = tokenized.tolist()
         if tokenized and isinstance(tokenized[0], list):
             tokenized = tokenized[0]
-        return list(tokenized)
+        prefix_ids = list(tokenized)
+        if str(self.config.get("if_ppl_prefix_mode", "standard")).strip().lower() == "empty_think":
+            open_think_ids = list(self.tokenizer.encode("<think>", add_special_tokens=False))
+            close_think_ids = list(self.tokenizer.encode("</think>\n\n", add_special_tokens=False))
+            closed_suffix = open_think_ids + close_think_ids
+            if prefix_ids[-len(closed_suffix) :] != closed_suffix:
+                if not open_think_ids or prefix_ids[-len(open_think_ids) :] != open_think_ids:
+                    raise RuntimeError(
+                        "if_ppl_prefix_mode=empty_think requires a chat template ending in '<think>'"
+                    )
+                prefix_ids.extend(close_think_ids)
+        self._validate_ppl_x_prefix_ids([prefix_ids])
+        return prefix_ids
 
     def _if_ref_anchor_cache_item_complete(self, item: dict | None) -> bool:
         if not item:
@@ -2461,6 +2744,26 @@ class RayPPOTrainer:
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
                     with marked_timer("reward", timing_raw, color="yellow"):
+                        llm_verifier_anchor_fallback_only = normalize_bool_config(
+                            OmegaConf.select(
+                                self.config,
+                                "reward.reward_kwargs.if_llm_verifier_anchor_fallback_only",
+                                default=False,
+                            ),
+                            False,
+                        )
+                        if llm_verifier_anchor_fallback_only:
+                            if not self.compute_reward_after_rollout:
+                                raise RuntimeError(
+                                    "if_llm_verifier_anchor_fallback_only requires reward.compute_after_rollout=true"
+                                )
+                            batch.non_tensor_batch["if_llm_verifier_phase"] = np.full(
+                                len(batch), "constraint", dtype=object
+                            )
+                            batch.non_tensor_batch["if_llm_verifier_eligible"] = np.zeros(
+                                len(batch), dtype=bool
+                            )
+
                         # compute reward model score
                         if (self.use_rm or self.compute_reward_after_rollout) and "rm_scores" not in batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(batch)
@@ -2477,79 +2780,7 @@ class RayPPOTrainer:
                                     "if_constraint/acc/min": float(np.min(if_constraint)),
                                 }
                             )
-                        if "llm_verifier_called" in reward_extra_infos_dict:
-                            verifier_called = np.asarray(
-                                reward_extra_infos_dict["llm_verifier_called"], dtype=np.float32
-                            )
-                            called_mask = verifier_called > 0.5
-                            called_count = int(np.sum(called_mask))
-                            verifier_metrics = {
-                                "if_llm_verifier/called_ratio": float(np.mean(verifier_called)),
-                                "if_llm_verifier/called_count": float(called_count),
-                            }
-
-                            if "llm_verifier_score" in reward_extra_infos_dict:
-                                verifier_scores = np.asarray(
-                                    reward_extra_infos_dict["llm_verifier_score"], dtype=np.float32
-                                )
-                                valid_score_mask = called_mask & np.isfinite(verifier_scores) & (verifier_scores >= 1)
-                                valid_scores = verifier_scores[valid_score_mask]
-                                verifier_metrics.update(
-                                    {
-                                        "if_llm_verifier/score_mean": (
-                                            float(np.mean(valid_scores)) if valid_scores.size else 0.0
-                                        ),
-                                        "if_llm_verifier/score_max": (
-                                            float(np.max(valid_scores)) if valid_scores.size else 0.0
-                                        ),
-                                        "if_llm_verifier/score_min": (
-                                            float(np.min(valid_scores)) if valid_scores.size else 0.0
-                                        ),
-                                    }
-                                )
-
-                            if "llm_verifier_pass" in reward_extra_infos_dict:
-                                verifier_pass = np.asarray(
-                                    reward_extra_infos_dict["llm_verifier_pass"], dtype=np.float32
-                                )
-                                verifier_metrics["if_llm_verifier/pass_rate"] = (
-                                    float(np.mean(verifier_pass[called_mask])) if called_count else 0.0
-                                )
-
-                            if "llm_verifier_bonus" in reward_extra_infos_dict:
-                                verifier_bonus = np.asarray(
-                                    reward_extra_infos_dict["llm_verifier_bonus"], dtype=np.float32
-                                )
-                                verifier_metrics["if_llm_verifier/bonus_mean"] = float(np.mean(verifier_bonus))
-
-                            if "llm_verifier_error" in reward_extra_infos_dict:
-                                verifier_errors = np.asarray(
-                                    reward_extra_infos_dict["llm_verifier_error"], dtype=object
-                                )
-                                called_errors = verifier_errors[called_mask]
-                                verifier_metrics["if_llm_verifier/error_rate"] = (
-                                    float(np.mean([bool(str(error).strip()) for error in called_errors]))
-                                    if called_count
-                                    else 0.0
-                                )
-
-                            if "constraint_reward" in reward_extra_infos_dict:
-                                constraint_rewards = np.asarray(
-                                    reward_extra_infos_dict["constraint_reward"], dtype=np.float32
-                                )
-                                verifier_metrics["if_llm_verifier/constraint_reward_mean"] = float(
-                                    np.mean(constraint_rewards)
-                                )
-
-                            if "scaled_reward" in reward_extra_infos_dict:
-                                scaled_rewards = np.asarray(
-                                    reward_extra_infos_dict["scaled_reward"], dtype=np.float32
-                                )
-                                verifier_metrics["if_llm_verifier/scaled_reward_mean"] = float(
-                                    np.mean(scaled_rewards)
-                                )
-
-                            metrics.update(verifier_metrics)
+                        verifier_metric_infos = reward_extra_infos_dict
                         # ##6/3 ppl## Optional zero-reward handling for max_response_length-clipped rollouts.
                         reward_tensor, clipped_reward_metrics = apply_clipped_rollout_reward_mode(
                             batch, reward_tensor, clipped_rollout_mode
@@ -2558,7 +2789,6 @@ class RayPPOTrainer:
                         # ##6/3 ppl## Snapshot the constraint-only reward BEFORE any PPL shaping so both
                         # directions gate on the original IF reward, not a PPL-polluted running total.
                         constraint_reward_scores = reward_tensor.sum(dim=-1).detach().clone()
-                        metrics.update(self._compute_anchor_ppl_with_ref_policy(batch))
                         # ##6/3 ppl## Rank rewards are applied after old IF reward exists and before advantage computation.
                         py_given_x_reward_coeff = float(
                             self.config.get("if_py_given_x_reward_coeff", self.config.get("if_ppl_reward_coeff", 1.0))
@@ -2570,6 +2800,80 @@ class RayPPOTrainer:
                         ref_ppl_gate_enabled = normalize_bool_config(self.config.get("if_ref_ppl_gate", False))
                         ref_ppl_gate_margin = float(self.config.get("if_ref_ppl_gate_margin", 0.0))
                         ppl_reward_strategy = str(self.config.get("if_ppl_reward_strategy", "rank")).strip().lower()
+                        verifier_fallback_bonus_scores = torch.zeros_like(constraint_reward_scores)
+                        if llm_verifier_anchor_fallback_only:
+                            if ppl_reward_strategy != "anchor":
+                                raise RuntimeError(
+                                    "if_llm_verifier_anchor_fallback_only requires if_ppl_reward_strategy=anchor"
+                                )
+                            if normalize_if_ppl_anchor_reward_mode(ppl_anchor_reward_mode) != "both":
+                                raise RuntimeError(
+                                    "if_llm_verifier_anchor_fallback_only requires "
+                                    "if_ppl_anchor_reward_mode=both"
+                                )
+                            if py_given_x_reward_coeff <= 0.0:
+                                raise RuntimeError(
+                                    "if_llm_verifier_anchor_fallback_only requires a positive "
+                                    "if_py_given_x_reward_coeff"
+                                )
+                            if px_given_y_reward_coeff != 0.0:
+                                raise RuntimeError(
+                                    "if_llm_verifier_anchor_fallback_only requires "
+                                    "if_px_given_y_reward_coeff=0"
+                                )
+                            if not normalize_bool_config(self.config.get("if_ref_policy_anchor_ppl", False)):
+                                raise RuntimeError(
+                                    "if_llm_verifier_anchor_fallback_only requires "
+                                    "if_ref_policy_anchor_ppl=true"
+                                )
+
+                            constraint_positive_mask = (
+                                constraint_reward_scores.detach().to(device="cpu", dtype=torch.float64).numpy() > 0.0
+                            )
+                            metrics.update(
+                                self._compute_anchor_ppl_with_ref_policy(
+                                    batch, eligible_mask=constraint_positive_mask
+                                )
+                            )
+                            anchor_interval_bonus_mask = get_if_ppl_anchor_interval_bonus_mask(
+                                batch,
+                                gate_scores=constraint_reward_scores,
+                                ppl_reward_coeff=py_given_x_reward_coeff,
+                                anchor_reward_mode=ppl_anchor_reward_mode,
+                                strict=True,
+                            )
+                            verifier_fallback_mask = build_if_llm_verifier_fallback_mask(
+                                constraint_reward_scores, anchor_interval_bonus_mask
+                            )
+                            metrics.update(
+                                {
+                                    "if_llm_verifier_fallback/constraint_positive_count": float(
+                                        constraint_positive_mask.sum()
+                                    ),
+                                    "if_llm_verifier_fallback/anchor_interval_count": float(
+                                        anchor_interval_bonus_mask.sum()
+                                    ),
+                                    "if_llm_verifier_fallback/eligible_count": float(verifier_fallback_mask.sum()),
+                                }
+                            )
+
+                            if verifier_fallback_mask.any():
+                                batch.non_tensor_batch["if_llm_verifier_phase"] = np.full(
+                                    len(batch), "verifier", dtype=object
+                                )
+                                batch.non_tensor_batch["if_llm_verifier_eligible"] = verifier_fallback_mask
+                                verifier_reward_batch = self._compute_reward_colocate(batch)
+                                verifier_reward_tensor, verifier_extra_infos = extract_reward(verifier_reward_batch)
+                                verifier_fallback_bonus_scores = verifier_reward_tensor.sum(dim=-1).detach().clone()
+                                verifier_metric_infos = verifier_extra_infos
+                                for key, value in verifier_extra_infos.items():
+                                    if key.startswith("llm_verifier_"):
+                                        reward_extra_infos_dict[key] = value
+                        else:
+                            metrics.update(self._compute_anchor_ppl_with_ref_policy(batch))
+
+                        if not llm_verifier_anchor_fallback_only:
+                            metrics.update(collect_if_llm_verifier_metrics(verifier_metric_infos))
                         if ppl_reward_strategy == "anchor":
                             reward_tensor, py_given_x_metrics = apply_if_ppl_anchor_reward(
                                 batch,
@@ -2611,6 +2915,20 @@ class RayPPOTrainer:
                                 rank_reward_mode=ppl_rank_reward_mode,
                             )
                             metrics.update(px_given_y_metrics)
+                        if llm_verifier_anchor_fallback_only:
+                            reward_tensor, verifier_fallback_metrics = apply_if_llm_verifier_fallback_bonus(
+                                batch,
+                                reward_tensor,
+                                verifier_fallback_bonus_scores,
+                                constraint_reward_scores,
+                            )
+                            metrics.update(verifier_fallback_metrics)
+                            final_reward_scores = reward_tensor.sum(dim=-1).detach().to(device="cpu")
+                            reward_extra_infos_dict["scaled_reward"] = final_reward_scores.numpy()
+                            batch.batch["rm_scores"] = reward_tensor
+                            metrics.update(collect_if_llm_verifier_metrics(reward_extra_infos_dict))
+                            batch.non_tensor_batch.pop("if_llm_verifier_phase", None)
+                            batch.non_tensor_batch.pop("if_llm_verifier_eligible", None)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
