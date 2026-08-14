@@ -22,8 +22,21 @@ BASE_SCRIPT="${VERL_DIR}/if_rlvr/exps/bidirectional/qwen3_4b_01_00_const1_ref_an
 
 export IF_REF_ANCHOR_CACHE_PATH=${SUBSET_CACHE:-${VERL_DIR}/.cache/if_ref_anchor_teacher4b_reasoning_train_seed1_val512_t1_p095_k20_pp0_r8192_scored_by_qwen3_4b.SUBSET4096.json}
 if [[ ! -s "${IF_REF_ANCHOR_CACHE_PATH}" ]]; then
-    echo "[subset4k] missing v2 subset cache: ${IF_REF_ANCHOR_CACHE_PATH}" >&2
-    echo "[subset4k] carve it from the completed v2 cache first (see data_subsets/qwen3_4b_reasoning_anchor4k/)." >&2
+    echo "[subset4k] subset cache not found locally; fetching from sangyon/anchor_cache ..."
+    mkdir -p "$(dirname "${IF_REF_ANCHOR_CACHE_PATH}")"
+    python3 - "${IF_REF_ANCHOR_CACHE_PATH}" <<'PY'
+import os, shutil, sys
+from huggingface_hub import hf_hub_download
+dest = sys.argv[1]
+src = hf_hub_download(repo_id="sangyon/anchor_cache", repo_type="dataset",
+                      filename=os.path.basename(dest))
+shutil.copyfile(src, dest)
+print(f"[subset4k] downloaded {os.path.basename(dest)} ({os.path.getsize(dest)/1e6:.1f} MB)")
+PY
+fi
+if [[ ! -s "${IF_REF_ANCHOR_CACHE_PATH}" ]]; then
+    echo "[subset4k] could not obtain the subset cache (${IF_REF_ANCHOR_CACHE_PATH});" >&2
+    echo "[subset4k] check network/HF access, or place the file there manually (it is public on sangyon/anchor_cache)." >&2
     exit 1
 fi
 

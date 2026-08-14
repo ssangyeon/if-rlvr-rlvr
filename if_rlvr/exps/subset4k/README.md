@@ -26,18 +26,15 @@ defaults preserve current behavior).
 
 1. This repo (the reward knobs live in `verl/trainer/ppo/ray_trainer.py`), a working verl
    conda/venv, 8×80GB GPUs.
-2. The subset cache at
-   `<repo>/.cache/if_ref_anchor_teacher4b_reasoning_train_seed1_val512_t1_p095_k20_pp0_r8192_scored_by_qwen3_4b.SUBSET4096.json`:
-   ```
-   huggingface-cli download sangyon/anchor_cache \
-     if_ref_anchor_teacher4b_reasoning_train_seed1_val512_t1_p095_k20_pp0_r8192_scored_by_qwen3_4b.SUBSET4096.json \
-     --repo-type dataset --local-dir .cache/
-   ```
-   (3,620 rows from the r8192 v2 build + 476 targeted r32768 fills; per-row provenance in
-   `if_rlvr/data_subsets/qwen3_4b_reasoning_anchor4k/v2_subset_provenance.json`.)
-3. `Qwen/Qwen3-4B` and `allenai/IF_multi_constraints_upto5` in the HF cache
-   (`HF_HOME` defaults to `<repo>/.cache/huggingface`; override if yours lives elsewhere).
-4. `WANDB_API_KEY` in the environment.
+2. Network access to the HF Hub on first run — everything data-side is fetched
+   automatically: the subset cache (public, from `sangyon/anchor_cache`; 3,620 r8192
+   rows + 476 targeted r32768 fills, provenance in
+   `if_rlvr/data_subsets/qwen3_4b_reasoning_anchor4k/v2_subset_provenance.json`),
+   `Qwen/Qwen3-4B`, `allenai/IF_multi_constraints_upto5`, and the NLTK punkt data.
+   `HF_HOME` defaults to `<repo>/.cache/huggingface`; override if your cache lives
+   elsewhere. Air-gapped boxes: pre-place the subset JSON at
+   `<repo>/.cache/<same filename>` and warm the HF caches.
+3. `WANDB_API_KEY` in the environment.
 
 ## Run
 
