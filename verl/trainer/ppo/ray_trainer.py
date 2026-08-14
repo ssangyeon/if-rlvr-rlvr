@@ -434,6 +434,20 @@ def apply_if_ppl_anchor_reward(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     # ##6/3 ppl## Anchor reward: zero reward below x-only ref PPL, bonus inside [ref0, ref1].
     anchor_reward_mode = normalize_if_ppl_anchor_reward_mode(anchor_reward_mode)
+    # ##2026-08 subset ablations## Two orthogonal knobs, defaults preserve current behavior:
+    #   IF_PPL_ANCHOR_FLIP_HANDLING: "abstain" (default; inverted pairs keep IF untouched)
+    #     | "strict" (pre-2026-08-09 semantics: the floor fires before the band-validity
+    #       check, so inverted rows with P < A receive the floor action).
+    #   IF_PPL_ANCHOR_FLOOR_ACTION: "zero" (default; cancel the whole IF reward)
+    #     | "ignore" (below-floor rows keep IF and forfeit the bonus)
+    #     | "penalty" (below-floor rows get IF - IF_PPL_ANCHOR_FLOOR_PENALTY, clamped at 0).
+    flip_handling = os.getenv("IF_PPL_ANCHOR_FLIP_HANDLING", "abstain").strip().lower()
+    if flip_handling not in {"abstain", "strict"}:
+        raise ValueError(f"IF_PPL_ANCHOR_FLIP_HANDLING must be abstain|strict, got: {flip_handling}")
+    floor_action = os.getenv("IF_PPL_ANCHOR_FLOOR_ACTION", "zero").strip().lower()
+    if floor_action not in {"zero", "ignore", "penalty"}:
+        raise ValueError(f"IF_PPL_ANCHOR_FLOOR_ACTION must be zero|ignore|penalty, got: {floor_action}")
+    floor_penalty = float(os.getenv("IF_PPL_ANCHOR_FLOOR_PENALTY", "0.1"))
     required = [
         policy_nll_key,
         policy_token_count_key,
@@ -477,6 +491,8 @@ def apply_if_ppl_anchor_reward(
 
     eligible_count = 0
     lower_zero_count = 0
+    floor_penalty_count = 0
+    floor_ignored_count = 0
     interval_bonus_count = 0
     above_ref1_count = 0
     invalid_anchor_count = 0
@@ -503,18 +519,32 @@ def apply_if_ppl_anchor_reward(
         policy_mean_nll = policy_nll / policy_count
         ref0_mean_nll = ref0_nll / ref0_count
         ref1_mean_nll = ref1_nll / ref1_count
-        if ref1_mean_nll < ref0_mean_nll:
+        inverted = ref1_mean_nll < ref0_mean_nll
+        if inverted and flip_handling == "abstain":
             # An inverted pair does not define the intended [x-only, x+c] interval.
             # Preserve the original IF reward instead of letting the lower-bound
-            # branch cancel it.
+            # branch cancel it. (flip_handling=strict reproduces the pre-2026-08-09
+            # order where the floor fired before this validity check.)
             invalid_anchor_count += 1
             continue
         if anchor_reward_mode != "no_lower_zero" and policy_mean_nll < ref0_mean_nll:
-            bonus[idx] = -base_scores[idx]
-            lower_zero_count += 1
-        elif anchor_reward_mode != "lower_zero_only" and policy_mean_nll <= ref1_mean_nll:
+            # Below the floor. The row is consumed here under EVERY floor_action:
+            # "ignore" must not fall through to the bonus branch, or it would
+            # silently become no_lower_zero (below-floor rows earning the bonus).
+            if floor_action == "zero":
+                bonus[idx] = -base_scores[idx]
+                lower_zero_count += 1
+            elif floor_action == "penalty":
+                bonus[idx] = -min(floor_penalty, float(base_scores[idx]))
+                floor_penalty_count += 1
+            else:  # ignore
+                floor_ignored_count += 1
+        elif (not inverted) and anchor_reward_mode != "lower_zero_only" and policy_mean_nll <= ref1_mean_nll:
             bonus[idx] += float(ppl_reward_coeff)
             interval_bonus_count += 1
+        elif inverted:
+            # strict mode only: inverted row not consumed by the floor branch.
+            invalid_anchor_count += 1
         else:
             above_ref1_count += int(policy_mean_nll > ref1_mean_nll)
 
@@ -539,6 +569,13 @@ def apply_if_ppl_anchor_reward(
         f"{metric_prefix}/finite_ref0_count": float(finite_ref0_count),
         f"{metric_prefix}/finite_ref1_count": float(finite_ref1_count),
         f"{metric_prefix}/lower_zero_count": float(lower_zero_count),
+        f"{metric_prefix}/floor_penalty_count": float(floor_penalty_count),
+        f"{metric_prefix}/floor_ignored_count": float(floor_ignored_count),
+        f"{metric_prefix}/flip_handling_strict": float(flip_handling == "strict"),
+        f"{metric_prefix}/floor_action_zero": float(floor_action == "zero"),
+        f"{metric_prefix}/floor_action_ignore": float(floor_action == "ignore"),
+        f"{metric_prefix}/floor_action_penalty": float(floor_action == "penalty"),
+        f"{metric_prefix}/floor_penalty_value": float(floor_penalty),
         f"{metric_prefix}/interval_bonus_count": float(interval_bonus_count),
         f"{metric_prefix}/above_ref1_count": float(above_ref1_count),
         f"{metric_prefix}/invalid_anchor_count": float(invalid_anchor_count),
@@ -626,7 +663,12 @@ def get_if_ppl_anchor_interval_bonus_mask(
         ref1_mean_nll = ref1_nll / ref1_count
         if ref1_mean_nll < ref0_mean_nll:
             continue
-        interval_mask[idx] = ref0_mean_nll <= policy_mean_nll <= ref1_mean_nll
+        if anchor_reward_mode == "no_lower_zero":
+            # With the floor disabled, apply_if_ppl_anchor_reward grants the bonus
+            # to every P <= ref1 row (including P < ref0); the mask must match.
+            interval_mask[idx] = policy_mean_nll <= ref1_mean_nll
+        else:
+            interval_mask[idx] = ref0_mean_nll <= policy_mean_nll <= ref1_mean_nll
     return interval_mask
 
 
@@ -2121,11 +2163,34 @@ class RayPPOTrainer:
                 "IF ref anchor precompute expected vLLM prompt-logprob scores from the agent loop, "
                 f"but missing fields: {missing}"
             )
-        nlls = np.asarray([float(value) for value in output.non_tensor_batch[f"{metric_prefix}_nll"][:size]], dtype=np.float64)
-        token_counts = np.asarray(
-            [int(value) for value in output.non_tensor_batch[f"{metric_prefix}_token_count"][:size]], dtype=np.int64
+
+        # A per-row scoring failure inside the agent loop (it catches and logs,
+        # leaving these fields unset -> None after batching) must not take the
+        # whole precompute batch down: coerce to the "unusable" sentinels so the
+        # row simply fails _if_ref_anchor_cache_item_complete and is retried on
+        # the next run, instead of raising TypeError on float(None) and losing
+        # every already-generated row in the batch.
+        def _as_float(value: Any) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return float("inf")
+
+        def _as_int(value: Any) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+
+        nlls = np.asarray(
+            [_as_float(value) for value in output.non_tensor_batch[f"{metric_prefix}_nll"][:size]], dtype=np.float64
         )
-        ppls = np.asarray([float(value) for value in output.non_tensor_batch[f"{metric_prefix}_ppl"][:size]], dtype=np.float64)
+        token_counts = np.asarray(
+            [_as_int(value) for value in output.non_tensor_batch[f"{metric_prefix}_token_count"][:size]], dtype=np.int64
+        )
+        ppls = np.asarray(
+            [_as_float(value) for value in output.non_tensor_batch[f"{metric_prefix}_ppl"][:size]], dtype=np.float64
+        )
         return nlls, token_counts, ppls
 
     def _make_anchor_generation_batch(self, rows: list[dict], prompt_key: str) -> DataProto:
@@ -2351,6 +2416,14 @@ class RayPPOTrainer:
         batch_size = int(self.config.get("if_ref_anchor_precompute_batch_size", self.config.data.get("gen_batch_size", self.config.data.train_batch_size)))
         save_interval = int(self.config.get("if_ref_anchor_cache_save_interval", 50000))
         agent_workers = int(self.config.actor_rollout_ref.rollout.agent.get("num_workers", 1))
+        # Actor weights are never updated inside precompute, so the per-batch
+        # sleep + full weight resync below is a no-op that still pays for a KV
+        # cache teardown and a whole-model reload on every replica. Skip it for
+        # standalone precompute jobs (`if_ref_anchor_precompute_only=true`), and
+        # keep the legacy cycle when precompute runs as a prologue to training.
+        resync_between_batches = not normalize_bool_config(
+            self.config.get("if_ref_anchor_precompute_only", False)
+        )
         next_save_count = ((initial_cached_count // save_interval) + 1) * save_interval if save_interval > 0 else total + 1
         last_saved_count = initial_cached_count
         print(
@@ -2415,7 +2488,7 @@ class RayPPOTrainer:
                         last_saved_count = completed_count
                         while next_save_count <= completed_count:
                             next_save_count += save_interval
-                    if end < total:
+                    if end < total and resync_between_batches:
                         self.checkpoint_manager.sleep_replicas()
                         self.checkpoint_manager.update_weights(self.global_steps)
         finally:
