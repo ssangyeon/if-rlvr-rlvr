@@ -149,12 +149,14 @@ PY
 # Hygiene validator (delta 4): DELETE bad rows so the next pass regenerates them.
 # Prints "deleted=N kept_bad=M" on stdout; exit 0 always (flow control is on counts).
 hygiene_pass() {
-    "${PYBIN}" - "${IF_REF_ANCHOR_CACHE_PATH}" "${MODEL_PATH}" <<'PY'
-import json, sys, os
+    "${PYBIN}" - "${IF_REF_ANCHOR_CACHE_PATH}" "${MODEL_PATH}" "${VERL_DIR}" <<'PY'
+import ast, json, sys, os
 from collections import Counter
-path, model = sys.argv[1], sys.argv[2]
+path, model, verl_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 if not os.path.exists(path):
     print("deleted=0 kept_bad=0 (no cache yet)"); sys.exit(0)
+sys.path.insert(0, verl_dir)
+sys.path.insert(0, os.path.join(verl_dir, "if_rlvr"))
 from transformers import AutoTokenizer
 tok = AutoTokenizer.from_pretrained(model)
 with open(path, "r", encoding="utf-8") as f:
@@ -181,6 +183,46 @@ def is_loop(ids):
     top = Counter(grams).most_common(1)[0][1]
     return top / len(grams) > 0.5
 
+# Measured on the 2026-08 v2 snapshot: 32.5% of loop-flagged y1 are LEGITIMATE
+# repetition -- copy/combination/new-family constraints demand repeated text, and
+# some answers pass every checker. Deleting those churns forever (a regenerated
+# correct answer is repetitive again). So a y1 loop is deleted only when the
+# answer also FAILS its own constraints. Fail-safe: any adjudication error keeps
+# the row (never delete on infrastructure failure). y0 has no constraints, so
+# y0 loops stay unconditionally deletable.
+_ds = None
+_idict = None
+_rts = None
+def y1_loop_is_legit(key, ids):
+    global _ds, _idict, _rts
+    try:
+        if _ds is None:
+            import datasets
+            from ifeval_oi import instructions_registry
+            from ifeval_oi.verifier import remove_thinking_section
+            d = datasets.load_dataset("allenai/IF_multi_constraints_upto5", split="train")
+            d = d.shuffle(seed=1)          # same split as if_dataset.py (val 512 held out)
+            _ds = d.select(range(512, len(d)))
+            _idict = instructions_registry.INSTRUCTION_DICT
+            _rts = remove_thinking_section
+        cd = ast.literal_eval(_ds[int(key)]["ground_truth"])[0]
+        if isinstance(cd, str):
+            cd = json.loads(cd)
+        keys_, kwargs_ = cd["instruction_id"], cd["kwargs"]
+        if {k.split(":")[0] for k in keys_} & {"copy", "combination", "new"}:
+            return True
+        txt = tok.decode(list(ids), skip_special_tokens=True)
+        ans = _rts(txt, require_think_end=False) or txt
+        for k, a in zip(keys_, kwargs_):
+            a = {} if a is None else {x: y for x, y in a.items() if y is not None}
+            inst = _idict[k](k)
+            inst.build_description(**a)
+            if not (txt.strip() and inst.check_following(ans)):
+                return False
+        return True
+    except Exception:
+        return True
+
 reasons = Counter()
 bad_keys = []
 for key, item in items.items():
@@ -189,7 +231,11 @@ for key, item in items.items():
     if len(y0) < 10: why = "y0_short"
     elif len(y1) < 10: why = "y1_short"
     elif list(y0) == list(y1): why = "y0_eq_y1"
-    elif is_loop(y1): why = "y1_loop"
+    elif is_loop(y1):
+        if y1_loop_is_legit(key, y1):
+            reasons["y1_loop_kept_legit"] += 1
+        else:
+            why = "y1_loop"
     elif is_loop(y0): why = "y0_loop"
     if why:
         bad_keys.append(key); reasons[why] += 1

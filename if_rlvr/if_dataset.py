@@ -227,6 +227,27 @@ class IFMultiConstraintsDataset(RLHFDataset):
                 f"from {before} rows using {cache_path}"
             )
 
+        # Optional explicit index filter (targeted anchor regeneration / subset runs).
+        # File format: JSON list of ints, or an object with an "indices" list.
+        index_filter_path = os.getenv("IF_TRAIN_INDEX_FILTER", "").strip()
+        if not want_val and index_filter_path:
+            with open(index_filter_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            wanted = payload.get("indices") if isinstance(payload, dict) else payload
+            wanted = {int(i) for i in (wanted or [])}
+            if not wanted:
+                raise RuntimeError(f"IF_TRAIN_INDEX_FILTER has no indices: {index_filter_path}")
+            before = len(rows)
+            rows = [row for row in rows if int(row["extra_info"]["index"]) in wanted]
+            if not rows:
+                raise RuntimeError(
+                    f"IF_TRAIN_INDEX_FILTER matched no train rows: {index_filter_path}"
+                )
+            print(
+                f"[IFMultiConstraintsDataset] IF_TRAIN_INDEX_FILTER kept {len(rows)} of {before} rows "
+                f"({len(wanted)} indices requested) from {index_filter_path}"
+            )
+
         self.dataframe: datasets.Dataset = datasets.Dataset.from_list(rows)
 
         total = len(self.dataframe)
