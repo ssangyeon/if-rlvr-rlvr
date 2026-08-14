@@ -41,6 +41,9 @@ declare -A ARM_SCRIPT=(
     [a4]=a4_anchor_penalty01.sh
     [a5]=a5_anchor_nofloor.sh
     [a1]=a1_anchor_flipabstain.sh
+    [b1]=b1_floor_margin.sh
+    [b2]=b2_k3min_floor.sh
+    [b3]=b3_flipabstain_penalty01.sh
 )
 
 say() { echo "[run_all $(date -u +'%m-%d %H:%M:%S')] $*"; }

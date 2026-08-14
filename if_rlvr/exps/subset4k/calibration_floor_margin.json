@@ -1,0 +1,213 @@
+{
+ "recommended_c": 0.7,
+ "target_wipe": 0.02,
+ "method": "pseudo-rollout replay: y1 as init rollout; P(m1 < m0 - c) over the subset",
+ "n_rows": 4096,
+ "curve": [
+  {
+   "c": 0.0,
+   "pseudo_wipe": 0.1182,
+   "pseudo_wipe_v1compliant": 0.121
+  },
+  {
+   "c": 0.05,
+   "pseudo_wipe": 0.1003,
+   "pseudo_wipe_v1compliant": 0.0943
+  },
+  {
+   "c": 0.1,
+   "pseudo_wipe": 0.0874,
+   "pseudo_wipe_v1compliant": 0.0818
+  },
+  {
+   "c": 0.15,
+   "pseudo_wipe": 0.0757,
+   "pseudo_wipe_v1compliant": 0.0668
+  },
+  {
+   "c": 0.2,
+   "pseudo_wipe": 0.0652,
+   "pseudo_wipe_v1compliant": 0.0576
+  },
+  {
+   "c": 0.25,
+   "pseudo_wipe": 0.0596,
+   "pseudo_wipe_v1compliant": 0.0543
+  },
+  {
+   "c": 0.3,
+   "pseudo_wipe": 0.054,
+   "pseudo_wipe_v1compliant": 0.0484
+  },
+  {
+   "c": 0.35,
+   "pseudo_wipe": 0.0469,
+   "pseudo_wipe_v1compliant": 0.0409
+  },
+  {
+   "c": 0.4,
+   "pseudo_wipe": 0.0403,
+   "pseudo_wipe_v1compliant": 0.0359
+  },
+  {
+   "c": 0.45,
+   "pseudo_wipe": 0.0352,
+   "pseudo_wipe_v1compliant": 0.0334
+  },
+  {
+   "c": 0.5,
+   "pseudo_wipe": 0.0315,
+   "pseudo_wipe_v1compliant": 0.0275
+  },
+  {
+   "c": 0.55,
+   "pseudo_wipe": 0.0286,
+   "pseudo_wipe_v1compliant": 0.0259
+  },
+  {
+   "c": 0.6,
+   "pseudo_wipe": 0.0244,
+   "pseudo_wipe_v1compliant": 0.0209
+  },
+  {
+   "c": 0.65,
+   "pseudo_wipe": 0.0215,
+   "pseudo_wipe_v1compliant": 0.02
+  },
+  {
+   "c": 0.7,
+   "pseudo_wipe": 0.0195,
+   "pseudo_wipe_v1compliant": 0.0167
+  },
+  {
+   "c": 0.75,
+   "pseudo_wipe": 0.0181,
+   "pseudo_wipe_v1compliant": 0.0159
+  },
+  {
+   "c": 0.8,
+   "pseudo_wipe": 0.0166,
+   "pseudo_wipe_v1compliant": 0.0142
+  },
+  {
+   "c": 0.85,
+   "pseudo_wipe": 0.0159,
+   "pseudo_wipe_v1compliant": 0.0142
+  },
+  {
+   "c": 0.9,
+   "pseudo_wipe": 0.0151,
+   "pseudo_wipe_v1compliant": 0.0125
+  },
+  {
+   "c": 0.95,
+   "pseudo_wipe": 0.0144,
+   "pseudo_wipe_v1compliant": 0.0117
+  },
+  {
+   "c": 1.0,
+   "pseudo_wipe": 0.0125,
+   "pseudo_wipe_v1compliant": 0.0117
+  },
+  {
+   "c": 1.05,
+   "pseudo_wipe": 0.0117,
+   "pseudo_wipe_v1compliant": 0.01
+  },
+  {
+   "c": 1.1,
+   "pseudo_wipe": 0.0112,
+   "pseudo_wipe_v1compliant": 0.0092
+  },
+  {
+   "c": 1.15,
+   "pseudo_wipe": 0.0105,
+   "pseudo_wipe_v1compliant": 0.0083
+  },
+  {
+   "c": 1.2,
+   "pseudo_wipe": 0.01,
+   "pseudo_wipe_v1compliant": 0.0083
+  },
+  {
+   "c": 1.25,
+   "pseudo_wipe": 0.0093,
+   "pseudo_wipe_v1compliant": 0.0083
+  },
+  {
+   "c": 1.3,
+   "pseudo_wipe": 0.0088,
+   "pseudo_wipe_v1compliant": 0.0083
+  },
+  {
+   "c": 1.35,
+   "pseudo_wipe": 0.0081,
+   "pseudo_wipe_v1compliant": 0.0083
+  },
+  {
+   "c": 1.4,
+   "pseudo_wipe": 0.0076,
+   "pseudo_wipe_v1compliant": 0.0083
+  },
+  {
+   "c": 1.45,
+   "pseudo_wipe": 0.0066,
+   "pseudo_wipe_v1compliant": 0.0067
+  },
+  {
+   "c": 1.5,
+   "pseudo_wipe": 0.0061,
+   "pseudo_wipe_v1compliant": 0.0067
+  },
+  {
+   "c": 1.55,
+   "pseudo_wipe": 0.0056,
+   "pseudo_wipe_v1compliant": 0.0058
+  },
+  {
+   "c": 1.6,
+   "pseudo_wipe": 0.0056,
+   "pseudo_wipe_v1compliant": 0.0058
+  },
+  {
+   "c": 1.65,
+   "pseudo_wipe": 0.0054,
+   "pseudo_wipe_v1compliant": 0.005
+  },
+  {
+   "c": 1.7,
+   "pseudo_wipe": 0.0054,
+   "pseudo_wipe_v1compliant": 0.005
+  },
+  {
+   "c": 1.75,
+   "pseudo_wipe": 0.0051,
+   "pseudo_wipe_v1compliant": 0.005
+  },
+  {
+   "c": 1.8,
+   "pseudo_wipe": 0.0051,
+   "pseudo_wipe_v1compliant": 0.005
+  },
+  {
+   "c": 1.85,
+   "pseudo_wipe": 0.0051,
+   "pseudo_wipe_v1compliant": 0.005
+  },
+  {
+   "c": 1.9,
+   "pseudo_wipe": 0.0051,
+   "pseudo_wipe_v1compliant": 0.005
+  },
+  {
+   "c": 1.95,
+   "pseudo_wipe": 0.0049,
+   "pseudo_wipe_v1compliant": 0.005
+  },
+  {
+   "c": 2.0,
+   "pseudo_wipe": 0.0044,
+   "pseudo_wipe_v1compliant": 0.005
+  }
+ ]
+}

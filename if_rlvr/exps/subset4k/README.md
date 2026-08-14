@@ -48,6 +48,21 @@ One arm:
 WANDB_API_KEY=... bash if_rlvr/exps/subset4k/a3_anchor_strict.sh
 ```
 
+## Stage 2 (run after Stage 1 picks the floor action)
+
+| # | script | what it tests | prerequisite |
+|---|---|---|---|
+| b1 | `b1_floor_margin.sh` | calibrated loosened floor: zero only when P < A − c (c=0.7 from `tools/calibrate_floor_margin.py`, 2% pseudo-wipe target) | none |
+| b2 | `b2_k3min_floor.sh` | k=3 floor (min-of-3 by default) on a derived cache from `tools/make_k3_floor_cache.py` | 2 extra y0-draw caches |
+| b3 | `b3_flipabstain_penalty01.sh` | flip-abstain + penalty composition | both components winning in Stage 1 |
+
+`tools/augment_subset_hv.py` prepares the ΣH/ΣV sidecar for the typicality-z arm
+(design + status in `ABLATION_NOTES.md`; the z trainer change is deliberately gated
+on Stage-1 results and a smoke test). The runner accepts Stage-2 arms too:
+`ARMS="b1 b2" bash run_all_arms.sh`.
+
+Design rationale, rejected ideas, backlog, and the decision log: **`ABLATION_NOTES.md`**.
+
 ## Notes
 
 - **Memory**: tuned for 8×80GB — engine sleep on, util 0.9, and `PPO_MAX_TOKEN_LEN_PER_GPU=65536`.

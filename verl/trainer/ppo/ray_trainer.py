@@ -448,6 +448,13 @@ def apply_if_ppl_anchor_reward(
     if floor_action not in {"zero", "ignore", "penalty"}:
         raise ValueError(f"IF_PPL_ANCHOR_FLOOR_ACTION must be zero|ignore|penalty, got: {floor_action}")
     floor_penalty = float(os.getenv("IF_PPL_ANCHOR_FLOOR_PENALTY", "0.1"))
+    #   IF_PPL_ANCHOR_FLOOR_MARGIN (nats, default 0.0): the floor fires at
+    #   P < A - margin, treating the single-draw anchor A as noisy. Rows landing
+    #   in [A - margin, A) fall through to the bonus branch by design (the band's
+    #   effective lower edge moves down with the floor).
+    floor_margin = float(os.getenv("IF_PPL_ANCHOR_FLOOR_MARGIN", "0.0"))
+    if floor_margin < 0:
+        raise ValueError(f"IF_PPL_ANCHOR_FLOOR_MARGIN must be >= 0, got: {floor_margin}")
     required = [
         policy_nll_key,
         policy_token_count_key,
@@ -527,7 +534,7 @@ def apply_if_ppl_anchor_reward(
             # order where the floor fired before this validity check.)
             invalid_anchor_count += 1
             continue
-        if anchor_reward_mode != "no_lower_zero" and policy_mean_nll < ref0_mean_nll:
+        if anchor_reward_mode != "no_lower_zero" and policy_mean_nll < ref0_mean_nll - floor_margin:
             # Below the floor. The row is consumed here under EVERY floor_action:
             # "ignore" must not fall through to the bonus branch, or it would
             # silently become no_lower_zero (below-floor rows earning the bonus).
@@ -576,6 +583,7 @@ def apply_if_ppl_anchor_reward(
         f"{metric_prefix}/floor_action_ignore": float(floor_action == "ignore"),
         f"{metric_prefix}/floor_action_penalty": float(floor_action == "penalty"),
         f"{metric_prefix}/floor_penalty_value": float(floor_penalty),
+        f"{metric_prefix}/floor_margin": float(floor_margin),
         f"{metric_prefix}/interval_bonus_count": float(interval_bonus_count),
         f"{metric_prefix}/above_ref1_count": float(above_ref1_count),
         f"{metric_prefix}/invalid_anchor_count": float(invalid_anchor_count),
@@ -668,7 +676,10 @@ def get_if_ppl_anchor_interval_bonus_mask(
             # to every P <= ref1 row (including P < ref0); the mask must match.
             interval_mask[idx] = policy_mean_nll <= ref1_mean_nll
         else:
-            interval_mask[idx] = ref0_mean_nll <= policy_mean_nll <= ref1_mean_nll
+            # Mirror the floor margin: rows in [A - margin, A) get the bonus in
+            # apply_if_ppl_anchor_reward, so they must count as bonused here too.
+            floor_margin = float(os.getenv("IF_PPL_ANCHOR_FLOOR_MARGIN", "0.0"))
+            interval_mask[idx] = (ref0_mean_nll - floor_margin) <= policy_mean_nll <= ref1_mean_nll
     return interval_mask
 
 
