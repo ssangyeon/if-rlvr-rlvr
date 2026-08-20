@@ -1,0 +1,105 @@
+{
+  "artifact_prefix": "qwen3_4b_reasoning_anchor20k_n3",
+  "created": "2026-08-20T16:25:00+09:00",
+  "code_provenance": {
+    "base_git_revision": "af34fac4b2dae646d0ddf5afa6dcfad7b4cc0745",
+    "exact_source_location": "qwen3_4b_reasoning_anchor20k_n3/code",
+    "github_base_revision": "4c605121dcef612ce3437cae0d02dc0b47a86ec1",
+    "github_branch_status": "published_to_main",
+    "github_source_location": "https://github.com/ssangyeon/if-rlvr-rlvr/tree/main/if_rlvr/data_subsets/qwen3_4b_reasoning_anchor20k"
+  },
+  "dataset_repo": "sangyon/anchor_cache",
+  "generation_protocol": {
+    "anchor_draw": "one y0 from x and one y1 from x+c",
+    "max_completion_tokens": 32768,
+    "max_prompt_tokens": 2048,
+    "model": "Qwen/Qwen3-4B",
+    "ppl_nll_scope": "final_answer_tokens_only",
+    "ppl_prefix_mode": "standard",
+    "presence_penalty": 0.0,
+    "reference_scorer": "Qwen/Qwen3-4B",
+    "temperature": 1.0,
+    "thinking": true,
+    "top_k": 20,
+    "top_p": 0.95
+  },
+  "remaining": {
+    "anchor_draws": 2125,
+    "full_response_generations": 4250,
+    "runs": [
+      "run2",
+      "run3"
+    ]
+  },
+  "runs": {
+    "run1": {
+      "available_before_completion": 17816,
+      "best_available_rows": 20449,
+      "generated_draws_recorded": 2664,
+      "generated_draws_train_ready": 2633,
+      "generated_keyset_complete": true,
+      "generated_not_train_ready_indices": [
+        6240,
+        8098,
+        14852,
+        18200,
+        29406,
+        35496,
+        36261,
+        40490,
+        41764,
+        44219,
+        45664,
+        50894,
+        53569,
+        55014,
+        55610,
+        58710,
+        61146,
+        64834,
+        73610,
+        77911,
+        78229,
+        80344,
+        82461,
+        84766,
+        84876,
+        87461,
+        87692,
+        87721,
+        87957,
+        91316,
+        93882
+      ],
+      "generated_not_train_ready_rows": 31,
+      "generated_sha256": "ea26cfefed13a19b470ccac1f4a3de2aee35b96d5b7601936ef0bb8ccfc480a0",
+      "missing_y0": 14,
+      "missing_y1": 18,
+      "planned_missing_draws": 2664,
+      "status": "one_shot_attempt_complete_with_31_invalid"
+    },
+    "run2": {
+      "available_rows": 19421,
+      "missing_draws": 1059,
+      "missing_keyset_sha256": "9dd14d6b596c3f01815090a761afaa7733847746340f81545236220a6616aba5",
+      "remaining_response_generations": 2118,
+      "source_revision": "bc72af3622590af3459181932e3e4949c162c0e8",
+      "status": "not_started"
+    },
+    "run3": {
+      "available_rows": 19414,
+      "missing_draws": 1066,
+      "missing_keyset_sha256": "aa223896431dedf6eec674cb1bf90a98af0c5850b6e58d9da1a05252c1f72757",
+      "remaining_response_generations": 2132,
+      "source_revision": "0e030ca1600da5306e5474985137060b7231d254",
+      "status": "not_started"
+    }
+  },
+  "selection": {
+    "rows": 20480,
+    "selected_keyset_sha256": "7ea9d335fac6af33f5cbbbda8129611933a70c66412913f0e540b2a3ad85f54f",
+    "selected_train_sha256": "370c2bec02efd6eb50524a045e210ec60ddb9974bd2befb8ff9e468fcfc580d9",
+    "subset_indices_sha256": "7952fdf77cbf0ca8a09a275a5c3e9cae7198b9e33eb2fa224ac593abb0aecbcb"
+  },
+  "version": 1
+}

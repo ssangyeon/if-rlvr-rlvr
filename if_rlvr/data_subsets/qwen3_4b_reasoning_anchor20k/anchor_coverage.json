@@ -1,0 +1,142 @@
+{
+  "coverage_intersections": {
+    "all_three_available": 17446,
+    "any_available": 19749,
+    "missing_any_run": 3034,
+    "none_available": 731,
+    "run1_run2_missing": 791,
+    "run1_run3_missing": 796,
+    "run2_run3_missing": 899
+  },
+  "created_unix": 1787121671.8419373,
+  "dataset": {
+    "path": "/data/IFIF/IFIF/.agent_runtime/subset20k/selected_train.parquet",
+    "post_split_train_rows": 94861,
+    "raw_rows": 95373,
+    "selected_rows": 20480,
+    "sha256": "370c2bec02efd6eb50524a045e210ec60ddb9974bd2befb8ff9e468fcfc580d9",
+    "validation_rows": 512
+  },
+  "runs": {
+    "run1": {
+      "available_cache": "/data/IFIF/IFIF/.agent_runtime/subset20k/anchor_views/run1.SUBSET20480.AVAILABLE.json",
+      "available_cache_sha256": "ee3a3863abdb03c51e0a68ee244a884d26109570c11b52e5b5eff010befb0649",
+      "available_rows": 17816,
+      "missing_rows": 2664,
+      "shards": [
+        {
+          "estimated_token_cost": 13196037,
+          "keyset_sha256": "f5dbe6350fb953a94081383393e706252eb459de3429b0417eb4703187e519a4",
+          "no_observed_draws": 183,
+          "rows": 665,
+          "shard": 0
+        },
+        {
+          "estimated_token_cost": 13196110,
+          "keyset_sha256": "0952ebf174c9c0c17fd85ffcb6778b85ff3791655bf4c7fddc8f9c1491426653",
+          "no_observed_draws": 183,
+          "rows": 666,
+          "shard": 1
+        },
+        {
+          "estimated_token_cost": 13196060,
+          "keyset_sha256": "9c4a8cfa0f1728192fa78de3b379b6385f924832662711b6e4a045961b6f42c0",
+          "no_observed_draws": 183,
+          "rows": 666,
+          "shard": 2
+        },
+        {
+          "estimated_token_cost": 13196051,
+          "keyset_sha256": "8643f0255e791cb0fd1c9d5c01b58b7f4fa8dcab9836fa840ede4dd83e1aecb4",
+          "no_observed_draws": 182,
+          "rows": 667,
+          "shard": 3
+        }
+      ],
+      "source_revision": "e948df687da29e5222dd4cbb37a59e8eeaf3faa7",
+      "source_sha256": "57a8128860896145cf22607b3d6e33327b3735f77a9ac239e6e05fbf6885937f"
+    },
+    "run2": {
+      "available_cache": "/data/IFIF/IFIF/.agent_runtime/subset20k/anchor_views/run2.SUBSET20480.AVAILABLE.json",
+      "available_cache_sha256": "5b7556066243f42292b036be0e8e791535d74172524b5c7a9202c0da29192f97",
+      "available_rows": 19421,
+      "missing_rows": 1059,
+      "shards": [
+        {
+          "estimated_token_cost": 12139021,
+          "keyset_sha256": "2ace4535ee23f0b885483922470f384a8580f850557abca0ab06f5675ccdf3b1",
+          "no_observed_draws": 183,
+          "rows": 265,
+          "shard": 0
+        },
+        {
+          "estimated_token_cost": 12139010,
+          "keyset_sha256": "6b5d6e6be128b3d7952788c121baf3576f8b70634bcaa28098b87bb7d2267b3b",
+          "no_observed_draws": 183,
+          "rows": 265,
+          "shard": 1
+        },
+        {
+          "estimated_token_cost": 12139028,
+          "keyset_sha256": "7acfc84c52c5afae64e9e508880186223405c23f798427fe585c3ef75d2794d5",
+          "no_observed_draws": 183,
+          "rows": 264,
+          "shard": 2
+        },
+        {
+          "estimated_token_cost": 12139014,
+          "keyset_sha256": "a6c12eabe925fdd9278795a6da39bfce8d7f930a24ba75283a11dde4f1bb6122",
+          "no_observed_draws": 182,
+          "rows": 265,
+          "shard": 3
+        }
+      ],
+      "source_revision": "bc72af3622590af3459181932e3e4949c162c0e8",
+      "source_sha256": "5c9da5d1b4ce0fb6b981f6dbdcaf53b51238a227f593d3e767a32b4d8dd6e765"
+    },
+    "run3": {
+      "available_cache": "/data/IFIF/IFIF/.agent_runtime/subset20k/anchor_views/run3.SUBSET20480.AVAILABLE.json",
+      "available_cache_sha256": "fd237d72e56a9e7923b01d87d508d285a2520407531a0d0d9cd53a4361686fdd",
+      "available_rows": 19414,
+      "missing_rows": 1066,
+      "shards": [
+        {
+          "estimated_token_cost": 12149569,
+          "keyset_sha256": "a0957351dcd5f942a8b792b05657e25237372c57e1d86a5d78739a0b7bbee85e",
+          "no_observed_draws": 183,
+          "rows": 267,
+          "shard": 0
+        },
+        {
+          "estimated_token_cost": 12149500,
+          "keyset_sha256": "7b4f22b0e8f30249d151a004fb093bb9e9ea0e4197b3d4d3f30379c2bf635b80",
+          "no_observed_draws": 183,
+          "rows": 266,
+          "shard": 1
+        },
+        {
+          "estimated_token_cost": 12149564,
+          "keyset_sha256": "0c2bcad2ee5c3ce39644c47d6bfa17bd19dabe7f670f916e661cd83835746509",
+          "no_observed_draws": 183,
+          "rows": 267,
+          "shard": 2
+        },
+        {
+          "estimated_token_cost": 12149479,
+          "keyset_sha256": "a217fbe1a728b0dee4f40ea28d1fe340e82dccd05d07c790b07f41b2c2d78f32",
+          "no_observed_draws": 182,
+          "rows": 266,
+          "shard": 3
+        }
+      ],
+      "source_revision": "0e030ca1600da5306e5474985137060b7231d254",
+      "source_sha256": "57a6e296964f3c4849fdc3543a8c665e6be62052ef093e6d70b942e3971f9cec"
+    }
+  },
+  "seconds": 55.78027653694153,
+  "selected_keyset_sha256": "7ea9d335fac6af33f5cbbbda8129611933a70c66412913f0e540b2a3ad85f54f",
+  "selected_rows": 20480,
+  "selection_manifest": "/data/IFIF/IFIF/if_rlvr/data_subsets/qwen3_4b_reasoning_anchor20k/subset_indices.json",
+  "selection_manifest_sha256": "7952fdf77cbf0ca8a09a275a5c3e9cae7198b9e33eb2fa224ac593abb0aecbcb",
+  "version": 1
+}

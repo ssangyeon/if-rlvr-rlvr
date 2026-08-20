@@ -1,0 +1,60 @@
+{
+  "accepted_swaps": 1911,
+  "all_checks_pass": true,
+  "best_draw_composite": 0.4181575790021585,
+  "checks": {
+    "TV_availability_pattern": {
+      "pass": true,
+      "threshold": 0.005,
+      "value": 0.003320148148074191
+    },
+    "TV_constraint_ID": {
+      "pass": true,
+      "threshold": 0.0015,
+      "value": 0.0002029673930603092
+    },
+    "TV_constraint_family": {
+      "pass": true,
+      "threshold": 0.001,
+      "value": 8.95781154911829e-05
+    },
+    "TV_source_domain": {
+      "pass": true,
+      "threshold": 0.005,
+      "value": 0.0012106474916650577
+    },
+    "TV_top100_ID_pairs": {
+      "pass": true,
+      "threshold": 0.005,
+      "value": 0.0022751773272127393
+    },
+    "TV_top200_signature": {
+      "pass": true,
+      "threshold": 0.01,
+      "value": 0.00811764223473351
+    },
+    "max_continuous_KS": {
+      "pass": true,
+      "threshold": 0.006,
+      "value": 0.0041069164200139285
+    }
+  },
+  "fixed_rows": 4096,
+  "manifest_sha256": "7952fdf77cbf0ca8a09a275a5c3e9cae7198b9e33eb2fa224ac593abb0aecbcb",
+  "missing_selected_anchors": {
+    "run1": 2664,
+    "run2": 1059,
+    "run3": 1066
+  },
+  "polished_composite": 0.0805611425707828,
+  "population_rows": 93882,
+  "random_composite_median": 0.49674602889649144,
+  "rerandomized_draws": 500,
+  "seconds": 30.12329363822937,
+  "seed": 20260819,
+  "selected_audit_sha256": "7fd04533eed1e43f3e2bc07dde47e5be54f9240f01a0c608f60fd14461db820d",
+  "subset_rows": 20480,
+  "swap_proposals": 30000,
+  "train_indices_sha256": "a634e56fde31fbfb92eb374b60dff41dd51399a05779b234d6d498baa37a8a33",
+  "version": 1
+}
