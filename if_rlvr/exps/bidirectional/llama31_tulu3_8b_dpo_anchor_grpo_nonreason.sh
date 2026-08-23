@@ -19,8 +19,41 @@ export PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-1024}
 export ACTOR_LR=${ACTOR_LR:-5e-7}
 export MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
 export MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}
-export PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-98304}
-export LOG_PROB_MAX_TOKEN_LEN_PER_GPU=${LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-98304}
+# REVISED 2026-08-20: kept at 98304 initially because myf68cle (the original
+# anchor run) also used 98304 - but myf68cle ran on a *different physical
+# machine* (its own data.custom_cls.path was under /data/IFIF/IFIF/, not this
+# box), so "the historical run used this value" is not evidence it fits in
+# memory on THIS box. It doesn't: this exact combination just OOM'd in
+# update_actor 10/10 times - "Tried to allocate 20.96 GiB" against ~100MB
+# free, the same magnitude and same phase as constraint-only's identical OOM
+# with the same 98304 setting. Reverted to 32768, now proven safe on this box
+# for this exact actor/batch/GPU configuration via constraint-only's clean run.
+export PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
+# REVERTED 2026-08-20: the 98304->131072 bump below was theoretically justified
+# (measured headroom during update_actor) but never actually load-tested under
+# real conditions, and constraint-only's near-identical 98304->98304(unchanged)-
+# but-gpu_mem_util-0.75->0.8 combination just deterministically OOM'd in
+# update_actor on all 10 auto-resume attempts. Given that demonstrated real
+# risk, reverting this run's own unvalidated bump too rather than risk a
+# second multi-hour incident for an unconfirmed, modest (single-digit-percent)
+# speed gain. Can reconsider later with an isolated, monitored test.
+# Lowered further, same day: 98304 here is itself unproven for the
+# forward-only phases on this box (only ppo_max_token_len_per_gpu=98304's
+# unsafety in the backward pass is confirmed) - going straight to 49152,
+# which IS proven safe on this box via constraint-only's clean run, rather
+# than gamble a third multi-hour incident on an unvalidated middle value.
+export LOG_PROB_MAX_TOKEN_LEN_PER_GPU=${LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-49152}
+# Original anchor run (wandb myf68cle) used gpu_memory_utilization=0.7; the
+# shared base script's own default is 0.8. Same risk class as the constraint-
+# only OOM just hit (less rollout-vs-actor headroom than the proven-stable
+# historical value) - matching it here before this run gets its own turn.
+# NOT a ":-" default - see the matching comment in
+# llama31_tulu3_8b_dpo_constraint_only_nonreason.sh: _llama31_tulu3_8b_common.sh
+# (sourced above) already sets this var via the same ":-" pattern, so a ":-"
+# here is silently inert (confirmed live: this exact bug meant constraint-only
+# kept running at gpu_memory_utilization=0.8 through two "fixes" that never
+# took effect). Unconditional assignment required.
+export ROLLOUT_GPU_MEM_UTIL=0.7
 export ROLLOUT_N=${ROLLOUT_N:-8}
 export AGENT_NUM_WORKERS=${AGENT_NUM_WORKERS:-32}
 export DATA_PROCESSOR_CPU_COUNT=${DATA_PROCESSOR_CPU_COUNT:-16}

@@ -513,8 +513,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.ref.ppo_max_token_len_per_gpu = self.config.ref.pop("log_prob_max_token_len_per_gpu", None)
             ref_config: ActorConfig = omega_conf_to_dataclass(self.config.ref)
 
+            # Normally the ref policy is just a frozen copy of actor/rollout's own
+            # weights (`model_config` above, itself built from `self.config.model`).
+            # IF_REF_POLICY_MODEL_PATH_OVERRIDE lets a run point the ref policy at a
+            # *different* checkpoint instead - e.g. when warm-starting actor/rollout
+            # from an already-RL-trained checkpoint to continue training, while a
+            # custom reward term (this repo's IF anchor/PPL reward) needs the
+            # reference-policy log-probs it consumes to stay pinned to the original
+            # base model rather than drifting to whatever actor/rollout now use.
+            # `HFModelConfig.__post_init__` resolves local_path/hf_config/tokenizer
+            # from `.path` eagerly at construction time, so mutating `.path` on the
+            # already-constructed `model_config` would leave those derived fields
+            # stale (still pointing at actor's checkpoint); re-running construction
+            # from a copy of the OmegaConf node is what actually re-resolves them.
+            # Unset (the default), this is byte-for-byte the previous behavior.
+            ref_model_path_override = os.environ.get("IF_REF_POLICY_MODEL_PATH_OVERRIDE", "").strip()
+            if ref_model_path_override:
+                ref_model_omega_conf = deepcopy(self.config.model)
+                with open_dict(ref_model_omega_conf):
+                    ref_model_omega_conf.path = ref_model_path_override
+                ref_config.model_config = omega_conf_to_dataclass(ref_model_omega_conf)
+            else:
+                ref_config.model_config = deepcopy(model_config)
             # The ref model does not need to enable MTP; force it to false.
-            ref_config.model_config = deepcopy(model_config)
             ref_config.model_config.mtp = MtpConfig(enable=False)
 
             # construct TrainingWorkerConfig

@@ -166,18 +166,19 @@ def ensure_readme(api: HfApi, repo_id: str, base_model: str, run_name: str, firs
     )
 
 
-def upload_step(api: HfApi, repo_id: str, folder: Path, step: int, run_name: str) -> None:
-    path_in_repo = f"global_step_{step}"
-    log(f"uploading {folder} -> {repo_id}:{path_in_repo}")
+def upload_step(api: HfApi, repo_id: str, folder: Path, step: int, run_name: str, step_offset: int = 0) -> None:
+    remote_step = step + step_offset
+    path_in_repo = f"global_step_{remote_step}"
+    log(f"uploading {folder} -> {repo_id}:{path_in_repo} (local step {step}, offset {step_offset})")
     started = time.monotonic()
     api.upload_folder(
         folder_path=str(folder),
         path_in_repo=path_in_repo,
         repo_id=repo_id,
         repo_type="model",
-        commit_message=f"{run_name or 'verl'}: global_step_{step}",
+        commit_message=f"{run_name or 'verl'}: global_step_{remote_step}",
     )
-    log(f"uploaded global_step_{step} in {time.monotonic() - started:.0f}s")
+    log(f"uploaded global_step_{remote_step} in {time.monotonic() - started:.0f}s")
 
 
 def sweep(args: argparse.Namespace, api: HfApi, uploaded: set[int]) -> bool:
@@ -203,8 +204,8 @@ def sweep(args: argparse.Namespace, api: HfApi, uploaded: set[int]) -> bool:
         for attempt in range(1, args.max_retries + 1):
             try:
                 ensure_repo(api, args.repo_id, args.private)
-                ensure_readme(api, args.repo_id, args.base_model, args.run_name, step)
-                upload_step(api, args.repo_id, folder, step, args.run_name)
+                ensure_readme(api, args.repo_id, args.base_model, args.run_name, step + args.step_offset)
+                upload_step(api, args.repo_id, folder, step, args.run_name, args.step_offset)
                 uploaded.add(step)
                 save_state(Path(args.state_file), uploaded)
                 changed = True
@@ -225,6 +226,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-name", default="", help="experiment name, used in commit messages and the card")
     parser.add_argument("--base-model", default="", help="base model id recorded in the generated model card")
     parser.add_argument("--private", action="store_true", help="create the repo private when it does not exist")
+    parser.add_argument(
+        "--step-offset",
+        type=int,
+        default=0,
+        help="added to each local global_step_<N> to compute the remote path, so a fresh trainer "
+        "instance (e.g. continuing training from a downloaded HF checkpoint, with no local optimizer "
+        "state to resume from) doesn't overwrite earlier steps already uploaded to the same repo",
+    )
     parser.add_argument("--once", action="store_true", help="sweep once and exit instead of watching")
     parser.add_argument("--poll-seconds", type=float, default=120.0, help="watch-mode poll interval")
     parser.add_argument("--max-retries", type=int, default=5, help="upload attempts per checkpoint")
