@@ -134,3 +134,6 @@ outputs
 restart_logs/
 merge_logs/
 .history
+
+# local installers
+Miniconda3-latest-Linux-x86_64.sh
