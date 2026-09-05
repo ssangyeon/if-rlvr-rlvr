@@ -15,6 +15,7 @@
 Tests for the metric utilities in verl.trainer.ppo.metric_utils.
 """
 
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -25,9 +26,11 @@ from verl.trainer.ppo.metric_utils import (
     bootstrap_metric,
     calc_maj_val,
     compute_data_metrics,
+    compute_think_split_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
+    resolve_think_end_token_id,
 )
 from verl.utils.metric import (
     reduce_metrics,
@@ -348,6 +351,201 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertIn("critic/score/mean", metrics)
         self.assertIn("critic/rewards/mean", metrics)
         self.assertIn("response_length/mean", metrics)
+
+
+class TestResolveThinkEndTokenId(unittest.TestCase):
+    """Tests for resolve_think_end_token_id."""
+
+    @staticmethod
+    def _tokenizer(vocab, unk_token=None, unk_token_id=None):
+        inverse = {v: k for k, v in vocab.items()}
+        tok = MagicMock()
+        tok.convert_tokens_to_ids.side_effect = lambda t: vocab.get(t, unk_token_id)
+        tok.convert_ids_to_tokens.side_effect = lambda i: inverse.get(i)
+        tok.unk_token = unk_token
+        tok.unk_token_id = unk_token_id
+        return tok
+
+    def test_resolves_single_token(self):
+        tok = self._tokenizer({"</think>": 151668})
+        self.assertEqual(resolve_think_end_token_id(tok), 151668)
+
+    def test_custom_marker(self):
+        tok = self._tokenizer({"</reasoning>": 7})
+        self.assertEqual(resolve_think_end_token_id(tok, "</reasoning>"), 7)
+        self.assertIsNone(resolve_think_end_token_id(tok, "</think>"))
+
+    def test_unknown_marker_returns_none(self):
+        # A tokenizer that maps every unknown token to <unk> must not be taken at its word.
+        tok = self._tokenizer({"<unk>": 0}, unk_token="<unk>", unk_token_id=0)
+        self.assertIsNone(resolve_think_end_token_id(tok))
+
+    def test_non_roundtripping_marker_returns_none(self):
+        tok = MagicMock()
+        tok.convert_tokens_to_ids.side_effect = lambda t: 5
+        tok.convert_ids_to_tokens.side_effect = lambda i: "something-else"
+        tok.unk_token = None
+        tok.unk_token_id = None
+        self.assertIsNone(resolve_think_end_token_id(tok))
+
+    def test_tokenizer_error_returns_none(self):
+        tok = MagicMock()
+        tok.convert_tokens_to_ids.side_effect = RuntimeError("boom")
+        self.assertIsNone(resolve_think_end_token_id(tok))
+
+    def test_env_marker_override(self):
+        tok = self._tokenizer({"</reasoning>": 7, "</think>": 151668})
+        with patch.dict(os.environ, {"IF_THINK_END_TOKEN": " </reasoning> "}):
+            self.assertEqual(resolve_think_end_token_id(tok), 7)
+
+    def test_env_disable_values_turn_the_split_off(self):
+        # A non-reasoning run sets this so every response is not reported as 100% reasoning.
+        tok = self._tokenizer({"</think>": 151668})
+        for value in ("", " ", "none", "NONE", "off", "disabled", "0"):
+            with self.subTest(value=value), patch.dict(os.environ, {"IF_THINK_END_TOKEN": value}):
+                self.assertIsNone(resolve_think_end_token_id(tok))
+
+    def test_env_unset_uses_default_marker(self):
+        tok = self._tokenizer({"</think>": 151668})
+        env = {k: v for k, v in os.environ.items() if k != "IF_THINK_END_TOKEN"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(resolve_think_end_token_id(tok), 151668)
+
+    def test_explicit_argument_ignores_env_disable(self):
+        tok = self._tokenizer({"</think>": 151668})
+        with patch.dict(os.environ, {"IF_THINK_END_TOKEN": "none"}):
+            self.assertEqual(resolve_think_end_token_id(tok, "</think>"), 151668)
+
+
+class TestComputeThinkSplitMetrics(unittest.TestCase):
+    """Tests for compute_think_split_metrics (reasoning vs. answer token split)."""
+
+    THINK_OPEN = 98
+    THINK_END = 99
+    WIDTH = 16
+
+    def _batch(self, rows, masks=None):
+        """rows: list of token-id lists. masks: optional list of 0/1 lists (defaults to length)."""
+        responses = torch.zeros(len(rows), self.WIDTH, dtype=torch.long)
+        mask = torch.zeros(len(rows), self.WIDTH, dtype=torch.long)
+        for i, ids in enumerate(rows):
+            responses[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+            if masks is None:
+                mask[i, : len(ids)] = 1
+            else:
+                mask[i, : len(masks[i])] = torch.tensor(masks[i], dtype=torch.long)
+        batch = MagicMock()
+        batch.batch = {"responses": responses, "response_mask": mask}
+        return batch
+
+    def test_disabled_when_token_id_is_none(self):
+        batch = self._batch([[self.THINK_OPEN, 1, self.THINK_END, 2]])
+        self.assertEqual(compute_think_split_metrics(batch, None), {})
+
+    def test_basic_split_and_identity(self):
+        # <think> 1 2 </think> 3 4 5  ->  3 reasoning tokens, 3 answer tokens, 7 total
+        batch = self._batch([[self.THINK_OPEN, 1, 2, self.THINK_END, 3, 4, 5]])
+        m = compute_think_split_metrics(batch, self.THINK_END)
+        self.assertEqual(m["think/reasoning_length/mean"], 3.0)
+        self.assertEqual(m["think/answer_length/mean"], 3.0)
+        self.assertEqual(m["think/has_think_end/ratio"], 1.0)
+        self.assertEqual(m["think/no_think_end/count"], 0.0)
+        # reasoning + answer + the marker itself == response length
+        self.assertEqual(
+            m["think/reasoning_length/mean"] + m["think/answer_length/mean"] + 1,
+            float(batch.batch["response_mask"].sum()),
+        )
+
+    def test_truncated_mid_thought_is_all_reasoning(self):
+        # Never closed the section and used the whole budget: all reasoning, no answer.
+        batch = self._batch([[self.THINK_OPEN] + [1] * (self.WIDTH - 1)])
+        m = compute_think_split_metrics(batch, self.THINK_END)
+        self.assertEqual(m["think/reasoning_length/mean"], float(self.WIDTH))
+        self.assertEqual(m["think/answer_length/mean"], 0.0)
+        self.assertEqual(m["think/has_think_end/ratio"], 0.0)
+        self.assertEqual(m["think/no_think_end/count"], 1.0)
+        self.assertEqual(m["think/no_think_end_at_max/ratio"], 1.0)
+        # Closed-only aggregates must be NaN rather than a misleading 0.
+        self.assertTrue(np.isnan(m["think/reasoning_length_closed/mean"]))
+        self.assertTrue(np.isnan(m["think/answer_length_closed/mean"]))
+
+    def test_closed_aggregates_exclude_unclosed_rows(self):
+        batch = self._batch(
+            [
+                [self.THINK_OPEN, 1, 2, self.THINK_END, 3, 4, 5],  # closed: 3 / 3
+                [self.THINK_OPEN] + [1] * (self.WIDTH - 1),  # unclosed: 16 / 0
+            ]
+        )
+        m = compute_think_split_metrics(batch, self.THINK_END)
+        self.assertEqual(m["think/reasoning_length/mean"], (3.0 + 16.0) / 2)
+        self.assertEqual(m["think/reasoning_length_closed/mean"], 3.0)
+        self.assertEqual(m["think/answer_length_closed/mean"], 3.0)
+        self.assertEqual(m["think/has_think_end/ratio"], 0.5)
+        self.assertEqual(m["think/reasoning_tokens_closed/total"], 3.0)
+        self.assertEqual(m["think/answer_tokens_closed/total"], 3.0)
+
+    def test_empty_answer_after_close(self):
+        batch = self._batch([[self.THINK_END]])
+        m = compute_think_split_metrics(batch, self.THINK_END)
+        self.assertEqual(m["think/reasoning_length/mean"], 0.0)
+        self.assertEqual(m["think/answer_length/mean"], 0.0)
+        self.assertEqual(m["think/answer_length_zero/ratio"], 1.0)
+
+    def test_splits_on_first_of_several_markers(self):
+        batch = self._batch([[self.THINK_OPEN, 1, self.THINK_END, 2, self.THINK_END, 3]])
+        m = compute_think_split_metrics(batch, self.THINK_END)
+        self.assertEqual(m["think/reasoning_length/mean"], 2.0)
+        self.assertEqual(m["think/answer_length/mean"], 3.0)
+        self.assertEqual(m["think/multi_think_end/ratio"], 1.0)
+
+    def test_marker_in_padding_is_ignored(self):
+        # A `</think>` beyond the valid span must not be treated as a close.
+        rows = [[1, 2, 3, self.THINK_END]]
+        masks = [[1, 1, 1, 0]]
+        m = compute_think_split_metrics(self._batch(rows, masks), self.THINK_END)
+        self.assertEqual(m["think/has_think_end/ratio"], 0.0)
+        self.assertEqual(m["think/reasoning_length/mean"], 3.0)
+        self.assertEqual(m["think/answer_length/mean"], 0.0)
+
+    def test_non_contiguous_mask_counts_valid_tokens_only(self):
+        # An excluded interior token must not be counted on either side of the marker.
+        rows = [[self.THINK_OPEN, 1, 2, self.THINK_END, 3, 4, 5]]
+        masks = [[1, 1, 0, 1, 1, 0, 1]]
+        m = compute_think_split_metrics(self._batch(rows, masks), self.THINK_END)
+        self.assertEqual(m["think/reasoning_length/mean"], 2.0)
+        self.assertEqual(m["think/answer_length/mean"], 2.0)
+
+    def test_reasoning_fraction_and_clip_ratio(self):
+        batch = self._batch(
+            [
+                [self.THINK_OPEN, 1, 2, self.THINK_END, 3, 4, 5],  # 3/7 reasoning, not clipped
+                [self.THINK_OPEN] + [1] * (self.WIDTH - 1),  # 16/16 reasoning, clipped
+            ]
+        )
+        m = compute_think_split_metrics(batch, self.THINK_END)
+        self.assertAlmostEqual(m["think/reasoning_token_fraction/mean"], (3 / 7 + 1.0) / 2, places=5)
+        self.assertAlmostEqual(m["think/reasoning_token_fraction_closed/mean"], 3 / 7, places=5)
+        self.assertEqual(m["think/answer_length_clip_ratio"], 0.5)
+
+    def test_falls_back_to_attention_mask(self):
+        batch = self._batch([[self.THINK_OPEN, 1, self.THINK_END, 2]])
+        responses = batch.batch["responses"]
+        response_mask = batch.batch["response_mask"]
+        # No response_mask: the prompt half is prepended to the attention mask.
+        prompt_pad = torch.ones(1, 4, dtype=torch.long)
+        batch.batch = {
+            "responses": responses,
+            "attention_mask": torch.cat([prompt_pad, response_mask], dim=-1),
+        }
+        m = compute_think_split_metrics(batch, self.THINK_END)
+        self.assertEqual(m["think/reasoning_length/mean"], 2.0)
+        self.assertEqual(m["think/answer_length/mean"], 1.0)
+
+    def test_custom_prefix(self):
+        batch = self._batch([[self.THINK_END, 1]])
+        m = compute_think_split_metrics(batch, self.THINK_END, prefix="reason")
+        self.assertIn("reason/answer_length/mean", m)
+        self.assertNotIn("think/answer_length/mean", m)
 
 
 class TestComputeTimingMetrics(unittest.TestCase):

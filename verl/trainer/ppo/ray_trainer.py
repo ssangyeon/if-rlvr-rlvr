@@ -45,10 +45,12 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_think_split_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
     process_validation_metrics,
+    resolve_think_end_token_id,
 )
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import (
@@ -2228,6 +2230,23 @@ class RayPPOTrainer:
             }
         )
 
+    @property
+    def think_end_token_id(self) -> int | None:
+        """Cached id of the reasoning-end token, or ``None`` when this tokenizer has no single
+        such token (non-reasoning model families), which disables the reasoning/answer split
+        metrics instead of reporting a bogus split."""
+        if not hasattr(self, "_think_end_token_id"):
+            self._think_end_token_id = resolve_think_end_token_id(self.tokenizer)
+            if self._think_end_token_id is None:
+                print(
+                    "[think metrics] no single reasoning-end token in this tokenizer "
+                    f"(marker={os.getenv('IF_THINK_END_TOKEN', '</think>')!r}); "
+                    "think/* reasoning-vs-answer length metrics are disabled"
+                )
+            else:
+                print(f"[think metrics] reasoning-end token id = {self._think_end_token_id}")
+        return self._think_end_token_id
+
     def _if_ref_anchor_cache_metadata(self) -> dict[str, Any]:
         data_cfg = self.config.data
         ppl_prefix_mode = str(self.config.get("if_ppl_prefix_mode", "standard")).strip().lower()
@@ -3212,6 +3231,8 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # Reasoning vs. answer token split (tokens before/after the first `</think>`).
+                metrics.update(compute_think_split_metrics(batch=batch, think_end_token_id=self.think_end_token_id))
                 # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
                 if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):

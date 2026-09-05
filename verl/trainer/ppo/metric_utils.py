@@ -16,6 +16,7 @@ Metrics related to the PPO trainer.
 """
 
 import logging
+import os
 from collections import defaultdict
 from functools import partial
 from typing import Any, Callable
@@ -265,6 +266,174 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    return metrics
+
+
+# Values of IF_THINK_END_TOKEN that explicitly disable the reasoning/answer split metrics.
+_THINK_END_DISABLE_VALUES = frozenset({"", "none", "off", "disabled", "0"})
+
+
+def resolve_think_end_token_id(tokenizer, think_end_token: str | None = None) -> int | None:
+    """Resolve the single token id that closes a reasoning section (e.g. Qwen3's ``</think>``).
+
+    Returns ``None`` when the marker is not a single token in this tokenizer's vocabulary, which
+    is the signal for callers to skip the reasoning/answer split metrics rather than emit
+    misleading numbers. The marker can be overridden with ``IF_THINK_END_TOKEN`` for model
+    families that close their reasoning channel with a different special token, or set to an
+    empty string / ``none`` / ``off`` / ``disabled`` / ``0`` to turn the split off outright --
+    the right setting for a NON-reasoning run, where the marker never appears in a response and
+    every rollout would otherwise be reported as 100% reasoning tokens.
+    """
+    if think_end_token is None:
+        raw = os.getenv("IF_THINK_END_TOKEN")
+        if raw is None:
+            think_end_token = "</think>"
+        else:
+            think_end_token = raw.strip()
+            if think_end_token.lower() in _THINK_END_DISABLE_VALUES:
+                return None
+    try:
+        token_id = tokenizer.convert_tokens_to_ids(think_end_token)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(token_id, int) or token_id < 0:
+        return None
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if unk_id is not None and token_id == unk_id and think_end_token != getattr(tokenizer, "unk_token", None):
+        return None
+    try:
+        if tokenizer.convert_ids_to_tokens(token_id) != think_end_token:
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    return token_id
+
+
+def compute_think_split_metrics(
+    batch: DataProto,
+    think_end_token_id: int | None,
+    prefix: str = "think",
+) -> dict[str, Any]:
+    """Split each response at the first reasoning-end token and measure both halves.
+
+    For a reasoning rollout ``<think> r_1..r_m </think> a_1..a_k`` the two quantities that
+    actually drive the length budget are tracked separately:
+
+    - ``reasoning_length``: tokens strictly BEFORE the first ``</think>`` (``m``, plus the
+      opening ``<think>`` when the chat template makes the policy emit it rather than
+      pre-filling it in the prompt).
+    - ``answer_length``: tokens strictly AFTER that ``</think>`` (``k``) -- the part the IFEval
+      verifier actually scores, since ``remove_thinking_section`` keeps only this span.
+
+    ``reasoning_length + answer_length + 1 == response_length`` for every response that closed
+    its reasoning section. Responses with no ``</think>`` (almost always a rollout truncated at
+    ``max_response_length`` mid-thought, which scores 0 under
+    ``IF_REQUIRE_THINK_END_FOR_REWARD``) are reported through ``no_think_end/*`` and excluded
+    from the ``*_closed/*`` aggregates so a growing truncation rate cannot masquerade as
+    shrinking answers.
+
+    Args:
+        batch: batch carrying ``responses`` and ``response_mask``.
+        think_end_token_id: id from :func:`resolve_think_end_token_id`; ``None`` disables the
+            metrics (returns an empty dict).
+        prefix: metric namespace.
+
+    Returns:
+        Metrics dict, or ``{}`` when the split cannot be computed.
+    """
+    if think_end_token_id is None:
+        return {}
+    if "responses" not in batch.batch.keys():
+        return {}
+
+    responses = batch.batch["responses"]
+    if "response_mask" in batch.batch.keys():
+        response_mask = batch.batch["response_mask"]
+    else:
+        response_mask = batch.batch["attention_mask"][:, -responses.shape[-1] :]
+    response_mask = response_mask[:, : responses.shape[-1]].bool()
+
+    valid_length = response_mask.sum(-1)  # (bsz,)
+    max_response_length = responses.shape[-1]
+
+    # Position of the first `</think>` inside the valid span (argmax returns the first hit).
+    # Rows with no marker get max_response_length, so the "before" span below is the whole
+    # response and the "after" span is empty -- which is exactly the truncated-mid-thought case.
+    is_think_end = (responses == think_end_token_id) & response_mask
+    has_think_end = is_think_end.any(-1)
+    think_end_pos = torch.where(
+        has_think_end,
+        is_think_end.to(torch.uint8).argmax(-1),
+        torch.full_like(valid_length, max_response_length),
+    ).unsqueeze(1)
+
+    # Count valid tokens on each side of the marker rather than deriving the answer span from
+    # `valid_length - pos - 1`: that shortcut assumes the response mask is contiguous from 0,
+    # which holds for single-turn rollouts but not once a mask excludes interior spans.
+    positions = torch.arange(max_response_length, device=responses.device).unsqueeze(0)
+    reasoning_length = (response_mask & (positions < think_end_pos)).sum(-1).float()
+    answer_length = (response_mask & (positions > think_end_pos)).sum(-1).float()
+
+    has_think_end_f = has_think_end.float()
+    valid_length_f = valid_length.float()
+
+    def _stats(name: str, values: torch.Tensor) -> dict[str, Any]:
+        if values.numel() == 0:
+            return {
+                f"{prefix}/{name}/mean": float("nan"),
+                f"{prefix}/{name}/max": float("nan"),
+                f"{prefix}/{name}/min": float("nan"),
+                f"{prefix}/{name}/p50": float("nan"),
+                f"{prefix}/{name}/p90": float("nan"),
+            }
+        return {
+            f"{prefix}/{name}/mean": torch.mean(values).detach().item(),
+            f"{prefix}/{name}/max": torch.max(values).detach().item(),
+            f"{prefix}/{name}/min": torch.min(values).detach().item(),
+            f"{prefix}/{name}/p50": torch.quantile(values, 0.5).detach().item(),
+            f"{prefix}/{name}/p90": torch.quantile(values, 0.9).detach().item(),
+        }
+
+    metrics: dict[str, Any] = {}
+    # Over the whole batch: reasoning_length is well defined either way (a truncated
+    # mid-thought rollout is all reasoning), answer_length is 0 where nothing closed.
+    metrics.update(_stats("reasoning_length", reasoning_length))
+    metrics.update(_stats("answer_length", answer_length))
+
+    # Over closed responses only: the un-confounded view of how the budget is being split.
+    closed = has_think_end
+    metrics.update(_stats("reasoning_length_closed", reasoning_length[closed]))
+    metrics.update(_stats("answer_length_closed", answer_length[closed]))
+
+    metrics[f"{prefix}/has_think_end/ratio"] = torch.mean(has_think_end_f).detach().item()
+    metrics[f"{prefix}/no_think_end/count"] = float((~has_think_end).sum().detach().item())
+    # A rollout that spent the entire budget reasoning: the pathology to watch for.
+    metrics[f"{prefix}/no_think_end_at_max/ratio"] = (
+        torch.mean(((~has_think_end) & (valid_length >= max_response_length)).float()).detach().item()
+    )
+
+    safe_valid = valid_length_f.clamp(min=1.0)
+    metrics[f"{prefix}/reasoning_token_fraction/mean"] = torch.mean(reasoning_length / safe_valid).detach().item()
+    if closed.any():
+        closed_valid = valid_length_f[closed].clamp(min=1.0)
+        metrics[f"{prefix}/reasoning_token_fraction_closed/mean"] = (
+            torch.mean(reasoning_length[closed] / closed_valid).detach().item()
+        )
+        # Aggregate token accounting, so a step's total budget split is readable directly.
+        metrics[f"{prefix}/reasoning_tokens_closed/total"] = float(reasoning_length[closed].sum().detach().item())
+        metrics[f"{prefix}/answer_tokens_closed/total"] = float(answer_length[closed].sum().detach().item())
+    else:
+        metrics[f"{prefix}/reasoning_token_fraction_closed/mean"] = float("nan")
+        metrics[f"{prefix}/reasoning_tokens_closed/total"] = 0.0
+        metrics[f"{prefix}/answer_tokens_closed/total"] = 0.0
+
+    # The verifier splits on the LAST `</think>` (``remove_thinking_section``) while this metric
+    # splits on the first, so the two agree exactly unless a response emits several markers.
+    metrics[f"{prefix}/multi_think_end/ratio"] = torch.mean((is_think_end.sum(-1) > 1).float()).detach().item()
+    metrics[f"{prefix}/answer_length_zero/ratio"] = torch.mean((closed & (answer_length == 0)).float()).detach().item()
+    metrics[f"{prefix}/answer_length_clip_ratio"] = (
+        torch.mean((valid_length >= max_response_length).float()).detach().item()
+    )
     return metrics
 
 
