@@ -26,6 +26,7 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 from ifeval_oi.verifier import remove_thinking_section, score_ifeval  # noqa: E402
+from intentcheck import INTENTCHECK_PROMPT, extract_intentcheck_verdict  # noqa: E402
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -245,7 +246,7 @@ def _chat_completions_url(base_url: str) -> str:
 
 
 class IFLLMVerifierRewardManager(RewardManagerBase):
-    """Instruction-following reward with a G-Eval style LLM verifier bonus."""
+    """Constraint reward plus an opt-in G-Eval or IntentCheck bonus."""
 
     def __init__(self, config, tokenizer, compute_score=None, reward_router_address=None, reward_model_tokenizer=None):
         super().__init__(config, tokenizer, compute_score)
@@ -256,6 +257,9 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
         self.reward_model_tokenizer = reward_model_tokenizer
         self.verification_reward = float(kwargs.get("verification_reward", 1.0))
         self.bonus = float(_get_with_env(kwargs, "if_llm_verifier_bonus", "IF_LLM_VERIFIER_BONUS", 0.1))
+        self.mode = str(_get_with_env(kwargs, "if_llm_verifier_mode", "IF_LLM_VERIFIER_MODE", "geval")).strip().lower()
+        if self.mode not in {"geval", "intentcheck"}:
+            raise ValueError(f"Unsupported if_llm_verifier_mode={self.mode!r}")
         self.threshold = int(_get_with_env(kwargs, "if_llm_verifier_threshold", "IF_LLM_VERIFIER_THRESHOLD", 5))
         self.model = str(
             _get_with_env(
@@ -304,6 +308,10 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
         self.response_format = _as_bool(
             _get_with_env(kwargs, "if_llm_verifier_response_format", "IF_LLM_VERIFIER_RESPONSE_FORMAT", False)
         )
+        if self.mode == "intentcheck":
+            # The paper asks for a checklist ending in Final Verification: YES/NO,
+            # not the numeric JSON object used by the legacy G-Eval evaluator.
+            self.response_format = False
         self.anchor_fallback_only = _as_bool(
             _get_with_env(
                 kwargs,
@@ -320,12 +328,13 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
             self.reward_fn_key = "data_source"
 
         logger.warning(
-            "IFLLMVerifierRewardManager: model=%s endpoints=%s threshold=%s bonus=%s "
+            "IFLLMVerifierRewardManager: model=%s mode=%s endpoints=%s threshold=%s bonus=%s "
             "response_format=%s omit_max_tokens=%s enable_thinking=%s reasoning_effort=%s "
             "anchor_fallback_only=%s",
             self.model,
+            self.mode,
             ",".join(self.base_urls) or f"router:{self.reward_router_address}",
-            self.threshold,
+            self.threshold if self.mode == "geval" else "<not used: YES/NO>",
             self.bonus,
             self.response_format,
             self.omit_max_tokens,
@@ -350,7 +359,10 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
         if not endpoint:
             return None, None, "missing IF_LLM_VERIFIER_BASE_URL(S) and reward_router_address"
 
-        judge_prompt = DEFAULT_JUDGE_PROMPT.format(prompt=prompt, response=response)
+        if self.mode == "intentcheck":
+            judge_prompt = INTENTCHECK_PROMPT.format(instruction_wo_strict=prompt, response=response)
+        else:
+            judge_prompt = DEFAULT_JUDGE_PROMPT.format(prompt=prompt, response=response)
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "user", "content": judge_prompt}],
@@ -381,10 +393,20 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
                 raw_judgment = _message_final_content(message)
                 if not raw_judgment:
                     raise ValueError("LLM verifier did not return final message.content")
-                return extract_judge_score(raw_judgment), raw_judgment, None
+                if self.mode == "intentcheck":
+                    score = extract_intentcheck_verdict(raw_judgment)
+                else:
+                    score = extract_judge_score(raw_judgment)
+                return score, raw_judgment, None
             except Exception as exc:  # noqa: BLE001
                 last_error = f"{type(exc).__name__}: {exc}"
         return None, raw_judgment, last_error
+
+    def _judge_passed(self, score: int | None) -> bool:
+        if score is None:
+            return False
+        # IntentCheck is binary; an inherited G-Eval threshold has no effect.
+        return score == 1 if self.mode == "intentcheck" else score >= self.threshold
 
     async def run_single(self, data: DataProto) -> dict:
         data = data[-1:]
@@ -438,7 +460,7 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
             if judge_response is None:
                 judge_response = response_str
             judge_score, raw_judgment, judge_error = await self._judge(prompt_text, judge_response)
-            if judge_score is not None and judge_score >= self.threshold:
+            if self._judge_passed(judge_score):
                 bonus = self.bonus
 
         if phase == "verifier":
@@ -456,10 +478,11 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
                 "llm_verifier_called": float(judge_called),
                 "llm_verifier_eligible": float(verifier_eligible),
                 "llm_verifier_score": float(judge_score if judge_score is not None else -1),
-                "llm_verifier_pass": float(judge_score is not None and judge_score >= self.threshold),
+                "llm_verifier_pass": float(self._judge_passed(judge_score)),
                 "llm_verifier_bonus": float(bonus),
                 "llm_verifier_error": judge_error or "",
                 "llm_verifier_prompt_source": "ppl_prompt",
+                "llm_verifier_mode": self.mode,
                 "llm_verifier_raw_judgment": (raw_judgment or "")[:500],
                 "llm_verifier_phase": phase,
                 "scaled_reward": float(reward),

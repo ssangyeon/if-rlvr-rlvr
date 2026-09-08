@@ -771,7 +771,25 @@ def collect_if_llm_verifier_metrics(reward_extra_infos_dict: dict[str, Any]) -> 
         metrics["if_llm_verifier/eligible_count"] = float(np.sum(eligible > 0.5))
     if "llm_verifier_score" in reward_extra_infos_dict:
         verifier_scores = np.asarray(reward_extra_infos_dict["llm_verifier_score"], dtype=np.float32)
-        valid_score_mask = called_mask & np.isfinite(verifier_scores) & (verifier_scores >= 1)
+        valid_score_mask = called_mask & np.isfinite(verifier_scores)
+        if "llm_verifier_mode" in reward_extra_infos_dict:
+            verifier_modes = np.asarray(reward_extra_infos_dict["llm_verifier_mode"], dtype=object)
+            if verifier_modes.shape != verifier_scores.shape:
+                raise ValueError(
+                    "LLM verifier modes and scores must have equal shape: "
+                    f"{verifier_modes.shape} != {verifier_scores.shape}"
+                )
+            intentcheck_mask = np.asarray(
+                [str(mode).strip().lower() == "intentcheck" for mode in verifier_modes], dtype=bool
+            )
+            valid_score_mask &= np.where(
+                intentcheck_mask,
+                (verifier_scores == 0) | (verifier_scores == 1),
+                verifier_scores >= 1,
+            )
+        else:
+            # Preserve the legacy G-Eval convention when no mode metadata is present.
+            valid_score_mask &= verifier_scores >= 1
         valid_scores = verifier_scores[valid_score_mask]
         metrics.update(
             {
