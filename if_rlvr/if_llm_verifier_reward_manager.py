@@ -260,7 +260,11 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
         self.mode = str(_get_with_env(kwargs, "if_llm_verifier_mode", "IF_LLM_VERIFIER_MODE", "geval")).strip().lower()
         if self.mode not in {"geval", "intentcheck"}:
             raise ValueError(f"Unsupported if_llm_verifier_mode={self.mode!r}")
-        self.threshold = int(_get_with_env(kwargs, "if_llm_verifier_threshold", "IF_LLM_VERIFIER_THRESHOLD", 5))
+        # float, not int: a fractional threshold like 5.3 would otherwise be silently
+        # truncated to 5 - i.e. one grade MORE permissive than asked for, in the
+        # opposite direction. Judge scores are integers (see extract_judge_score), so
+        # a threshold of T passes exactly the scores >= ceil(T) when T is fractional.
+        self.threshold = float(_get_with_env(kwargs, "if_llm_verifier_threshold", "IF_LLM_VERIFIER_THRESHOLD", 5))
         self.model = str(
             _get_with_env(
                 kwargs,
@@ -285,6 +289,11 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
             _get_with_env(kwargs, "if_llm_verifier_temperature", "IF_LLM_VERIFIER_TEMPERATURE", 0.0)
         )
         self.top_p = float(_get_with_env(kwargs, "if_llm_verifier_top_p", "IF_LLM_VERIFIER_TOP_P", 1.0))
+        # vLLM-only sampling extensions. Both default to "not sent", so an endpoint that
+        # rejects unknown body fields is unaffected unless a caller opts in. Qwen3 in
+        # non-thinking mode wants top_k=20, min_p=0 next to temperature 0.7 / top_p 0.8.
+        self.top_k = int(_get_with_env(kwargs, "if_llm_verifier_top_k", "IF_LLM_VERIFIER_TOP_K", -1))
+        self.min_p = float(_get_with_env(kwargs, "if_llm_verifier_min_p", "IF_LLM_VERIFIER_MIN_P", 0.0))
         self.max_tokens = int(_get_with_env(kwargs, "if_llm_verifier_max_tokens", "IF_LLM_VERIFIER_MAX_TOKENS", 8192))
         self.omit_max_tokens = _as_bool(
             _get_with_env(kwargs, "if_llm_verifier_omit_max_tokens", "IF_LLM_VERIFIER_OMIT_MAX_TOKENS", False)
@@ -329,6 +338,7 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
 
         logger.warning(
             "IFLLMVerifierRewardManager: model=%s mode=%s endpoints=%s threshold=%s bonus=%s "
+            "sampling=(temperature=%s top_p=%s top_k=%s min_p=%s) "
             "response_format=%s omit_max_tokens=%s enable_thinking=%s reasoning_effort=%s "
             "anchor_fallback_only=%s",
             self.model,
@@ -336,6 +346,10 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
             ",".join(self.base_urls) or f"router:{self.reward_router_address}",
             self.threshold if self.mode == "geval" else "<not used: YES/NO>",
             self.bonus,
+            self.temperature,
+            self.top_p,
+            self.top_k if self.top_k > 0 else "<unset>",
+            self.min_p if self.min_p > 0 else "<unset>",
             self.response_format,
             self.omit_max_tokens,
             self.enable_thinking if self.enable_thinking is not None else "<default>",
@@ -369,6 +383,10 @@ class IFLLMVerifierRewardManager(RewardManagerBase):
             "temperature": self.temperature,
             "top_p": self.top_p,
         }
+        if self.top_k > 0:
+            payload["top_k"] = self.top_k
+        if self.min_p > 0:
+            payload["min_p"] = self.min_p
         if not self.omit_max_tokens:
             payload["max_tokens"] = self.max_tokens
         if self.enable_thinking is not None:
