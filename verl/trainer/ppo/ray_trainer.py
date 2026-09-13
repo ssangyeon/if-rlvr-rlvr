@@ -140,8 +140,17 @@ def compute_response_mask(data: DataProto):
 
 # ##6/3 ppl## How to handle rollouts that reach max_response_length: use, zero reward, or drop.
 _CLIPPED_ROLLOUT_MODES = {"use", "zero", "drop"}
+_IF_PPL_REWARD_STRATEGIES = {"rank", "anchor", "inverse_ppl", "raw_likelihood"}
 _IF_PPL_RANK_REWARD_MODES = {"both", "high_only"}
 _IF_PPL_ANCHOR_REWARD_MODES = {"both", "no_lower_zero", "lower_zero_only"}
+
+
+def normalize_if_ppl_reward_strategy(strategy: Any) -> str:
+    """Reject unknown reward strategies instead of silently applying rank shaping."""
+    normalized = str(strategy).strip().lower()
+    if normalized not in _IF_PPL_REWARD_STRATEGIES:
+        raise ValueError(f"if_ppl_reward_strategy must be one of {_IF_PPL_REWARD_STRATEGIES}, got: {strategy}")
+    return normalized
 
 
 def normalize_clipped_rollout_mode(mode: Any) -> str:
@@ -242,6 +251,114 @@ def apply_clipped_rollout_reward_mode(
     updated_reward = reward_tensor.clone()
     updated_reward[clipped_mask.to(updated_reward.device)] = 0.0
     return updated_reward, metrics
+
+
+def _apply_if_likelihood_reward(
+    batch: DataProto,
+    reward_tensor: torch.Tensor,
+    ppl_reward_coeff: float = 1.0,
+    clipped_rollout_mode: Any = "use",
+    *,
+    length_normalized: bool,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Add raw or length-normalized reference likelihood, including IF=0 responses.
+
+    NLL and N come from the frozen reference scoring the continuation given x.
+    Neither variant uses anchors, ranks, thresholds, or a constraint-success gate.
+    Empty or invalid sequences contribute zero. The trainer handles the constraint part
+    of clipped-rollout zeroing; this function excludes its likelihood term too.
+    """
+    strategy = "inverse_ppl" if length_normalized else "raw_likelihood"
+    coeff = float(ppl_reward_coeff)
+    if not math.isfinite(coeff) or coeff < 0:
+        raise ValueError(f"{strategy} requires a finite, nonnegative if_py_given_x_reward_coeff")
+    required = ("p_y_given_x_nll", "p_y_given_x_token_count")
+    missing = [key for key in required if key not in batch.non_tensor_batch]
+    if missing:
+        raise ValueError(f"{strategy} requires reference likelihood scores; missing fields: {missing}")
+
+    size = reward_tensor.shape[0]
+    nlls, token_counts = (batch.non_tensor_batch[key] for key in required)
+    if len(nlls) != size or len(token_counts) != size:
+        raise ValueError(f"{strategy} NLL and token counts must match the reward batch size")
+
+    response_lengths = batch.batch["response_mask"].sum(dim=-1).detach().cpu().long()
+    likelihoods = np.zeros(size, dtype=np.float64)
+    valid = np.zeros(size, dtype=bool)
+    for idx, (nll, count, length) in enumerate(zip(nlls, token_counts, response_lengths.tolist(), strict=True)):
+        try:
+            nll, count = float(nll), int(count)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if length <= 0 or count <= 0 or not math.isfinite(nll) or nll < 0:
+            continue
+        valid[idx] = True
+        likelihoods[idx] = math.exp(-nll / count) if length_normalized else math.exp(-nll)
+
+    excluded = np.zeros(size, dtype=bool)
+    if normalize_clipped_rollout_mode(clipped_rollout_mode) == "zero":
+        excluded = get_clipped_rollout_mask(batch).detach().cpu().numpy().astype(bool)
+    terms = torch.as_tensor(likelihoods, dtype=reward_tensor.dtype, device=reward_tensor.device) * coeff
+    terms[torch.as_tensor(excluded, device=terms.device)] = 0.0
+    updated_reward = reward_tensor.clone()
+    rows = torch.nonzero(terms, as_tuple=True)[0]
+    last_positions = (response_lengths - 1).clamp_min(0).to(updated_reward.device)
+    updated_reward[rows, last_positions[rows]] += terms[rows]
+
+    # Keep raw per-answer values in the batch for diagnostics as well as aggregates.
+    field = "p_y_given_x_likelihood" if length_normalized else "p_y_given_x_raw_likelihood"
+    batch.non_tensor_batch[field] = likelihoods.astype(object)
+    prefix = f"if_{field}"
+    base_scores = reward_tensor.sum(dim=-1)
+    composed_scores = updated_reward.sum(dim=-1)
+    metrics = {
+        f"{prefix}/reward_coeff": coeff,
+        f"{prefix}/valid_count": float(valid.sum()),
+        f"{prefix}/invalid_count": float((~valid).sum()),
+        f"{prefix}/clipped_excluded_count": float(excluded.sum()),
+    }
+    if not length_normalized:
+        # Diagnose tiny probabilities without flooring, rescaling, or normalizing them.
+        positive = valid & ~excluded & (likelihoods > 0) & (coeff > 0)
+        metrics[f"{prefix}/zero_likelihood_count"] = float((valid & (likelihoods == 0)).sum())
+        metrics[f"{prefix}/term_underflow_count"] = float((positive & (terms.detach().cpu().numpy() == 0)).sum())
+        metrics[f"{prefix}/rounded_away_count"] = float(
+            ((terms > 0) & (composed_scores == base_scores)).sum().detach().cpu().item()
+        )
+    distributions = {
+        "likelihood": likelihoods[valid],
+        "likelihood_reward": terms.detach().cpu().double().numpy(),
+        "base_reward": base_scores.detach().cpu().double().numpy(),
+        "composed_reward": composed_scores.detach().cpu().double().numpy(),
+    }
+    for name, values in distributions.items():
+        for stat in ("mean", "std", "min", "max"):
+            metrics[f"{prefix}/{name}/{stat}"] = float(getattr(values, stat)()) if values.size else 0.0
+    return updated_reward, metrics
+
+
+def apply_if_inverse_ppl_reward(
+    batch: DataProto,
+    reward_tensor: torch.Tensor,
+    ppl_reward_coeff: float = 1.0,
+    clipped_rollout_mode: Any = "use",
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Add coeff * exp(-NLL / N), the geometric mean reference token probability."""
+    return _apply_if_likelihood_reward(
+        batch, reward_tensor, ppl_reward_coeff, clipped_rollout_mode, length_normalized=True
+    )
+
+
+def apply_if_raw_likelihood_reward(
+    batch: DataProto,
+    reward_tensor: torch.Tensor,
+    ppl_reward_coeff: float = 1.0,
+    clipped_rollout_mode: Any = "use",
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Add coeff * exp(-summed NLL), the reference probability of the final answer given x."""
+    return _apply_if_likelihood_reward(
+        batch, reward_tensor, ppl_reward_coeff, clipped_rollout_mode, length_normalized=False
+    )
 
 
 def apply_if_ppl_rank_reward(
@@ -1028,6 +1145,19 @@ class RayPPOTrainer:
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.config)
+        self.if_ppl_reward_strategy = normalize_if_ppl_reward_strategy(
+            self.config.get("if_ppl_reward_strategy", "rank")
+        )
+        if self.if_ppl_reward_strategy in {"inverse_ppl", "raw_likelihood"}:
+            strategy = self.if_ppl_reward_strategy
+            if not self.use_reference_policy or not normalize_bool_config(
+                self.config.get("if_ref_policy_anchor_ppl", False)
+            ):
+                raise ValueError(f"{strategy} requires an enabled reference policy and if_ref_policy_anchor_ppl=true")
+            if normalize_bool_config(self.config.get("if_ref_anchor_precompute", False)):
+                raise ValueError(f"{strategy} requires if_ref_anchor_precompute=false; it does not use anchors")
+            if float(self.config.get("if_px_given_y_reward_coeff", 0.0)) != 0.0:
+                raise ValueError(f"{strategy} requires if_px_given_y_reward_coeff=0; it scores only y given x")
         self.use_teacher_policy = need_teacher_policy(self.config)
 
         self.use_rm = need_reward_model(self.config)
@@ -2086,7 +2216,10 @@ class RayPPOTrainer:
         return nlls, token_counts, ppls
 
     def _compute_anchor_ppl_with_ref_policy(
-        self, batch: DataProto, eligible_mask: np.ndarray | None = None
+        self,
+        batch: DataProto,
+        eligible_mask: np.ndarray | None = None,
+        include_anchors: bool = True,
     ) -> dict[str, float]:
         if not normalize_bool_config(self.config.get("if_ref_policy_anchor_ppl", False)):
             return {}
@@ -2104,6 +2237,7 @@ class RayPPOTrainer:
                     "Anchor PPL eligibility mask must match the batch: "
                     f"{len(scoring_mask)} != {len(prefixes)}"
                 )
+        # Both likelihood baselines score the same extracted final answer as anchors.
         policy_y = [
             list(ids or []) if scoring_mask is None or scoring_mask[idx] else []
             for idx, ids in enumerate(batch.non_tensor_batch["ppl_y_final_answer_ids"])
@@ -2133,27 +2267,28 @@ class RayPPOTrainer:
                 )
 
         metric_specs = [("p_y_given_x", policy_y)]
-        if has_cached_scores("p_y_ref_given_x"):
-            log_cached_score_metrics("p_y_ref_given_x")
-        elif "ppl_y_ref0_ids" in batch.non_tensor_batch:
-            ref0_y = [
-                list(ids or []) if scoring_mask is None or scoring_mask[idx] else []
-                for idx, ids in enumerate(batch.non_tensor_batch["ppl_y_ref0_ids"])
-            ]
-            metric_specs.append(("p_y_ref_given_x", ref0_y))
-        else:
-            metrics["if_ref_policy_anchor_ppl/p_y_ref_given_x/missing_cache"] = 1.0
+        if include_anchors:
+            if has_cached_scores("p_y_ref_given_x"):
+                log_cached_score_metrics("p_y_ref_given_x")
+            elif "ppl_y_ref0_ids" in batch.non_tensor_batch:
+                ref0_y = [
+                    list(ids or []) if scoring_mask is None or scoring_mask[idx] else []
+                    for idx, ids in enumerate(batch.non_tensor_batch["ppl_y_ref0_ids"])
+                ]
+                metric_specs.append(("p_y_ref_given_x", ref0_y))
+            else:
+                metrics["if_ref_policy_anchor_ppl/p_y_ref_given_x/missing_cache"] = 1.0
 
-        if has_cached_scores("p_y_ref_xc_given_x"):
-            log_cached_score_metrics("p_y_ref_xc_given_x")
-        elif "ppl_y_ref1_ids" in batch.non_tensor_batch:
-            ref1_y = [
-                list(ids or []) if scoring_mask is None or scoring_mask[idx] else []
-                for idx, ids in enumerate(batch.non_tensor_batch["ppl_y_ref1_ids"])
-            ]
-            metric_specs.append(("p_y_ref_xc_given_x", ref1_y))
-        else:
-            metrics["if_ref_policy_anchor_ppl/p_y_ref_xc_given_x/missing_cache"] = 1.0
+            if has_cached_scores("p_y_ref_xc_given_x"):
+                log_cached_score_metrics("p_y_ref_xc_given_x")
+            elif "ppl_y_ref1_ids" in batch.non_tensor_batch:
+                ref1_y = [
+                    list(ids or []) if scoring_mask is None or scoring_mask[idx] else []
+                    for idx, ids in enumerate(batch.non_tensor_batch["ppl_y_ref1_ids"])
+                ]
+                metric_specs.append(("p_y_ref_xc_given_x", ref1_y))
+            else:
+                metrics["if_ref_policy_anchor_ppl/p_y_ref_xc_given_x/missing_cache"] = 1.0
 
         for prefix, continuations in metric_specs:
             nlls, token_counts, ppls = self._score_continuations_with_ref_policy(prefixes, continuations)
@@ -2924,7 +3059,7 @@ class RayPPOTrainer:
                         ppl_anchor_reward_mode = self.config.get("if_ppl_anchor_reward_mode", "both")
                         ref_ppl_gate_enabled = normalize_bool_config(self.config.get("if_ref_ppl_gate", False))
                         ref_ppl_gate_margin = float(self.config.get("if_ref_ppl_gate_margin", 0.0))
-                        ppl_reward_strategy = str(self.config.get("if_ppl_reward_strategy", "rank")).strip().lower()
+                        ppl_reward_strategy = self.if_ppl_reward_strategy
                         verifier_fallback_bonus_scores = torch.zeros_like(constraint_reward_scores)
                         if llm_verifier_anchor_fallback_only:
                             if ppl_reward_strategy != "anchor":
@@ -2995,7 +3130,12 @@ class RayPPOTrainer:
                                     if key.startswith("llm_verifier_"):
                                         reward_extra_infos_dict[key] = value
                         else:
-                            metrics.update(self._compute_anchor_ppl_with_ref_policy(batch))
+                            metrics.update(
+                                self._compute_anchor_ppl_with_ref_policy(
+                                    batch,
+                                    include_anchors=ppl_reward_strategy not in {"inverse_ppl", "raw_likelihood"},
+                                )
+                            )
 
                         if not llm_verifier_anchor_fallback_only:
                             metrics.update(collect_if_llm_verifier_metrics(verifier_metric_infos))
@@ -3007,6 +3147,20 @@ class RayPPOTrainer:
                                 metric_prefix="if_p_y_given_x_anchor",
                                 gate_scores=constraint_reward_scores,
                                 anchor_reward_mode=ppl_anchor_reward_mode,
+                            )
+                        elif ppl_reward_strategy == "inverse_ppl":
+                            reward_tensor, py_given_x_metrics = apply_if_inverse_ppl_reward(
+                                batch,
+                                reward_tensor,
+                                ppl_reward_coeff=py_given_x_reward_coeff,
+                                clipped_rollout_mode=clipped_rollout_mode,
+                            )
+                        elif ppl_reward_strategy == "raw_likelihood":
+                            reward_tensor, py_given_x_metrics = apply_if_raw_likelihood_reward(
+                                batch,
+                                reward_tensor,
+                                ppl_reward_coeff=py_given_x_reward_coeff,
+                                clipped_rollout_mode=clipped_rollout_mode,
                             )
                         else:
                             reward_tensor, py_given_x_metrics = apply_if_ppl_rank_reward(

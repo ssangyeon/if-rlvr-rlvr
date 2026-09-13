@@ -620,7 +620,12 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 x_prompt_ids = await self._build_ppl_x_prompt_ids(kwargs.get("ppl_prompt"))
                 ppl_extra_fields["ppl_x_prompt_ids"] = list(x_prompt_ids)
                 score_answer_ids = list(final_answer_ids) if final_answer_eligible else []
-                if not score_answer_ids and not (
+                # Missing final answers must not reward unfinished reasoning in either likelihood baseline.
+                likelihood_reward = str(self.config.get("if_ppl_reward_strategy", "rank")).strip().lower() in {
+                    "inverse_ppl",
+                    "raw_likelihood",
+                }
+                if not score_answer_ids and not likelihood_reward and not (
                     kwargs.get("__if_anchor_precompute__", False) and self.anchor_precompute_final_answer_only
                 ):
                     score_answer_ids = self._strip_leading_whitespace_ids(response_ids)
