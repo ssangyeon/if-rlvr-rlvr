@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 
 import torch
 from tensordict import TensorDict
@@ -93,6 +94,10 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     response_mask = data["response_mask"].to(bool)
     # compute policy loss
     old_log_prob = data["old_log_probs"]
+    if os.environ.get("VERL_SKIP_OLD_LOGPROB_ON_POLICY", "0") == "1":
+        # Strictly on-policy (enforced by the trainer): pi_old == pi_theta, so the ratio is exactly 1
+        # and the gradient is identical to using a recomputed old_log_prob.
+        old_log_prob = log_prob.detach()
     advantages = data["advantages"]
     rollout_is_weights = data.get("rollout_is_weights", None)
 

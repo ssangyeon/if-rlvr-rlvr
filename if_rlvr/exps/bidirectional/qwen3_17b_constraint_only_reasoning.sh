@@ -39,4 +39,4 @@ export IF_REF_ANCHOR_TRAIN_CACHED_ONLY=${IF_REF_ANCHOR_TRAIN_CACHED_ONLY:-false}
 
 export EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_17b_grpo_think_constraint_only_b1024_c1}
 
-exec bash "${SCRIPT_DIR}/qwen3_4b_01_00_const1_ref_anchor_reasoning.sh"
+exec bash "${SCRIPT_DIR}/qwen3_4b_01_00_const1_ref_anchor_reasoning.sh" "$@"

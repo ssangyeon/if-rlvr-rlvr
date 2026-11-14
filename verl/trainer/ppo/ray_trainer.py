@@ -3215,7 +3215,39 @@ class RayPPOTrainer:
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                    # Strictly on-policy runs (one optimizer step per batch: ppo_epochs == 1 and
+                    # ppo_mini_batch_size == train_batch_size) never move the policy between rollout and
+                    # update, so pi_old == pi_theta and the recomputed old_log_prob only ever produces
+                    # ratio == 1. With VERL_SKIP_OLD_LOGPROB_ON_POLICY=1 that forward pass is skipped and
+                    # ppo_loss uses log_prob.detach() as old_log_prob instead: same gradient, ~15% less
+                    # step time. actor/entropy (a by-product of that pass) is no longer logged.
+                    skip_old_log_prob = os.environ.get("VERL_SKIP_OLD_LOGPROB_ON_POLICY", "0") == "1"
+                    if skip_old_log_prob:
+                        actor_cfg = self.config.actor_rollout_ref.actor
+                        on_policy = (
+                            actor_cfg.ppo_epochs == 1
+                            and actor_cfg.ppo_mini_batch_size == self.config.data.train_batch_size
+                            and not self.config.algorithm.get("use_kl_in_reward", False)
+                            and not bypass_recomputing_logprobs
+                            and (
+                                rollout_corr_config is None
+                                or (
+                                    rollout_corr_config.get("rollout_is", None) is None
+                                    and rollout_corr_config.get("rollout_rs", None) is None
+                                )
+                            )
+                        )
+                        if not on_policy:
+                            raise ValueError(
+                                "VERL_SKIP_OLD_LOGPROB_ON_POLICY=1 requires a strictly on-policy update "
+                                "(ppo_epochs=1, ppo_mini_batch_size=train_batch_size, no KL-in-reward, "
+                                "no rollout correction / bypass mode)"
+                            )
+                        # Placeholder only: ppo_loss replaces it with log_prob.detach().
+                        batch.batch["old_log_probs"] = torch.zeros_like(
+                            batch.batch["response_mask"], dtype=torch.float32
+                        )
+                    elif bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
                         apply_bypass_mode(
@@ -3294,6 +3326,7 @@ class RayPPOTrainer:
                             rollout_corr_config is not None
                             and "rollout_log_probs" in batch.batch
                             and not bypass_recomputing_logprobs  # Only in decoupled mode
+                            and not skip_old_log_prob  # old_log_probs is only a placeholder then
                         ):
                             from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 
